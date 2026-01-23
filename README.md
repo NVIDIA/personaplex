@@ -15,6 +15,20 @@ PersonaPlex is a real-time, full-duplex speech-to-speech conversational model th
 
 ## Usage
 
+### Prerequisites
+
+Install the [Opus audio codec](https://github.com/xiph/opus) development library:
+```bash
+# Ubuntu/Debian
+sudo apt install libopus-dev
+
+# Fedora/RHEL
+sudo dnf install opus-devel
+
+# macOS
+brew install opus
+```
+
 ### Installation
 
 Download this repository and install with:
