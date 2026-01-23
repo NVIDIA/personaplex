@@ -183,3 +183,13 @@ mlx-trace.json
 # Include everything in assets
 !assets/
 !assets/**
+
+
+# Claude Code local settings (added by init-team-ai)
+.claude/
+*.local.json
+Agents.md
+Claude.local.md
+.agent/
+.DS_Store
+Thumbs.db

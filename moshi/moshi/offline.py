@@ -377,6 +377,10 @@ def main():
         "--device", type=str, default="cuda", help="Device on which to run, defaults to 'cuda'."
     )
     parser.add_argument("--seed", type=int, default=-1, help="Seed for reproducibility (-1 disables)")
+    parser.add_argument(
+        "--save-voice-embeddings", action="store_true",
+        help="Save voice prompt embeddings to a .pt file for faster reuse"
+    )
 
     args = parser.parse_args()
 
@@ -399,6 +403,7 @@ def main():
 
     # Normalize greedy flag behavior (True if present, False otherwise)
     greedy = bool(args.greedy)
+    save_embeddings = bool(args.save_voice_embeddings)
 
     with torch.no_grad():
         run_inference(
@@ -418,7 +423,7 @@ def main():
             topk_audio=args.topk_audio,
             topk_text=args.topk_text,
             greedy=greedy,
-            save_voice_prompt_embeddings=False,
+            save_voice_prompt_embeddings=save_embeddings,
         )
 
 

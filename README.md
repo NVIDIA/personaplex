@@ -17,15 +17,33 @@ PersonaPlex is a real-time, full-duplex speech-to-speech conversational model th
 
 ### Installation
 
-Download this repository and install with:
+Download this repository and set up the environment:
+
+#### Option 1: Using Conda (Recommended)
 ```bash
+# Create and activate conda environment
+conda create -n personaplex python=3.10 -y
+conda activate personaplex
+
+# Install the moshi package
 pip install moshi/.
 ```
 
-Extra step for Blackwell based GPUs as suggested in (See https://github.com/NVIDIA/personaplex/issues/2):
+#### Option 2: For Blackwell GPUs (RTX 50 series)
+Blackwell GPUs require PyTorch with CUDA 12.8. Install PyTorch first, then the moshi package:
 ```bash
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# Create and activate conda environment
+conda create -n personaplex python=3.10 -y
+conda activate personaplex
+
+# Install PyTorch with CUDA 12.8 FIRST
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# Then install the moshi package (will use existing PyTorch)
+pip install moshi/.
 ```
+
+See https://github.com/NVIDIA/personaplex/issues/2 for more details on Blackwell GPU support.
 
 
 ### Accept Model License
@@ -82,6 +100,45 @@ Natural(female): NATF0, NATF1, NATF2, NATF3
 Natural(male):   NATM0, NATM1, NATM2, NATM3
 Variety(female): VARF0, VARF1, VARF2, VARF3, VARF4
 Variety(male):   VARM0, VARM1, VARM2, VARM3, VARM4
+```
+
+### Custom Voices
+
+You can create custom voice embeddings from your own audio recordings:
+
+**Step 1: Prepare your audio file**
+
+Record a ~10 second WAV file of clear speech. Convert it to mono 24kHz format:
+```bash
+ffmpeg -i your_recording.wav -ac 1 -ar 24000 my_voice.wav
+```
+
+**Step 2: Copy to voices directory**
+
+Copy the converted audio to the voices directory:
+```bash
+cp my_voice.wav ~/.cache/huggingface/hub/models--nvidia--personaplex-7b-v1/snapshots/*/voices/
+```
+
+**Step 3: Generate voice embeddings**
+
+Run the offline script with `--save-voice-embeddings` to generate the `.pt` file:
+```bash
+python -m moshi.offline \
+  --voice-prompt "my_voice.wav" \
+  --save-voice-embeddings \
+  --input-wav "assets/test/input_assistant.wav" \
+  --output-wav "/tmp/test_output.wav" \
+  --output-text "/tmp/test_output.json"
+```
+
+This creates `my_voice.pt` in the voices directory. You can now use it with the server or offline mode:
+```bash
+# With the server (select from dropdown in Web UI)
+python -m moshi.server --ssl "$SSL_DIR"
+
+# With offline mode
+python -m moshi.offline --voice-prompt "my_voice.pt" ...
 ```
 
 ## Prompting Guide
