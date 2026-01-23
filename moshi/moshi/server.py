@@ -45,7 +45,7 @@ import sphn
 import torch
 import random
 
-from .client_utils import make_log, colorize
+from .client_utils import setup_client_logging
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
@@ -355,6 +355,7 @@ def _get_static_path(static: Optional[str]) -> Optional[str]:
 
 
 def main():
+    setup_client_logging()
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost", type=str)
     parser.add_argument("--port", default=8998, type=int)

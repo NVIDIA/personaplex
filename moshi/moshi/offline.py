@@ -52,15 +52,16 @@ import sentencepiece
 import sphn
 from huggingface_hub import hf_hub_download
 
-from .client_utils import make_log
+from .client_utils import setup_client_logging
 from .models import loaders, LMGen, MimiModel
 from .models.lm import load_audio as lm_load_audio
 from .models.lm import _iterate_audio as lm_iterate_audio
 from .models.lm import encode_from_sphn as lm_encode_from_sphn
+from .utils.logging import print_log
 
 
 def log(level: str, msg: str):
-    print(make_log(level, msg))
+    print_log(level, msg)
 
 
 def seed_all(seed: int):
@@ -320,6 +321,7 @@ def run_inference(
 
 def main():
     """Parse CLI args and run offline inference."""
+    setup_client_logging()
     parser = argparse.ArgumentParser(
         description="Offline inference from WAV input using Moshi server components."
     )
