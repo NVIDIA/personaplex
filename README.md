@@ -70,7 +70,7 @@ Access the Web UI directly at https://11.54.401.33:8998
 
 For offline evaluation use the offline script that streams in an input wav file and produces an output wav file from the captured output stream. The output file will be the same duration as the input file.
 
-Add `--cpu-offload` to any command below if your GPU has insufficient memory (requires `accelerate` package).
+Add `--cpu-offload` to any command below if your GPU has insufficient memory (requires `accelerate` package). Or install cpu-only PyTorch for offline evaluation on pure CPU.
 
 **Assistant example:**
 ```bash
