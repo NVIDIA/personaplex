@@ -33,7 +33,7 @@ brew install opus
 
 Download this repository and install with:
 ```bash
-pip install moshi/.
+pip install moshi
 ```
 
 Extra step for Blackwell based GPUs as suggested in (See https://github.com/NVIDIA/personaplex/issues/2):
