@@ -265,8 +265,8 @@ class RingKVCache:
         B, H, T, D = k.shape
         indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype) + self.end_offset
         indexes = indexes % self.capacity
-        self.cache[0].index_copy_(2, indexes, k)
-        self.cache[1].index_copy_(2, indexes, v)
+        self.cache[0][:, :, indexes, :] = k
+        self.cache[1][:, :, indexes, :] = v
         self.end_offset.add_(T)
 
         keys = self.cache[0]
