@@ -10,11 +10,11 @@ dependencies = [
     "sentencepiece == 0.2",
     "sounddevice == 0.5",
     "sphn >= 0.1.4, < 0.2",
-    "torch == 2.10.0",
-    "torchvision == 0.25.0",
-    "torchaudio == 2.10.0",
-    "aiohttp>=3.10.5, <3.11",
-    "accelerate==1.12.0",
+    "torch >= 2.9, < 2.11",
+    "torchaudio >= 2.9, < 2.11",
+    "torchvision >= 0.24, < 0.26",
+    "aiohttp >= 3.10.5, < 3.11",
+    "accelerate >= 1.12, < 1.13",
 ]
 authors = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
 maintainers = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
@@ -34,9 +34,9 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu130" }]
-torchvision = [{ index = "pytorch-cu130" }]
-torchaudio = [{ index = "pytorch-cu130" }]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform != 'darwin'" }]
+torchvision = [{ index = "pytorch-cu130", marker = "sys_platform != 'darwin'" }]
+torchaudio = [{ index = "pytorch-cu130", marker = "sys_platform != 'darwin'" }]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
