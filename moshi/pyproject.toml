@@ -14,6 +14,7 @@ dependencies = [
     "torchvision == 0.25.0",
     "torchaudio == 2.10.0",
     "aiohttp>=3.10.5, <3.11",
+    "accelerate==1.12.0",
 ]
 authors = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
 maintainers = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
