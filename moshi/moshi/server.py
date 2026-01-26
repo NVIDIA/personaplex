@@ -49,6 +49,7 @@ from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
+from .voice_discovery import VoiceDiscovery
 
 
 logger = setup_logger(__name__)
@@ -308,6 +309,20 @@ class ServerState:
         clog.log("info", "done with connection")
         return ws
 
+    async def handle_list_voices(self, request):
+        """List all available voices from configured directories."""
+        try:
+            voices = VoiceDiscovery.list_voices()
+            return web.json_response({
+                'voices': voices,
+                'count': len(voices)
+            })
+        except Exception as e:
+            logger.error(f"Error listing voices: {e}")
+            return web.json_response({
+                'error': str(e)
+            }, status=500)
+
 
 def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
     """
@@ -457,7 +472,19 @@ def main():
     logger.info("warming up the model")
     state.warmup()
     app = web.Application()
+
+    # Register API routes FIRST before static catch-all
+    async def test_endpoint(request):
+        return web.json_response({"status": "ok", "test": True})
+
+    app.router.add_get("/api/test", test_endpoint)
     app.router.add_get("/api/chat", state.handle_chat)
+    app.router.add_get("/api/voices", state.handle_list_voices)
+
+    # Debug: log registered routes
+    logger.info(f"Registered routes so far: {[r.resource.canonical for r in app.router.routes()]}")
+
+    # Register static routes AFTER API routes
     if static_path is not None:
         async def handle_root(_):
             return web.FileResponse(os.path.join(static_path, "index.html"))
@@ -467,6 +494,9 @@ def main():
         app.router.add_static(
             "/", path=static_path, follow_symlinks=True, name="static"
         )
+
+    # Debug: log all routes after registration
+    logger.info(f"All registered routes: {[(r.method, r.resource.canonical) for r in app.router.routes()]}")
     protocol = "http"
     ssl_context = None
     if args.ssl is not None:
