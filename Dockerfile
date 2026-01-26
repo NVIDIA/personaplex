@@ -22,4 +22,6 @@ RUN mkdir -p /app/ssl
 EXPOSE 8998
 
 ENTRYPOINT []
-CMD ["/app/moshi/.venv/bin/python", "-m", "moshi.server", "--ssl", "/app/ssl"]
+#CMD ["/app/moshi/.venv/bin/python", "-m", "moshi.server", "--ssl", "/app/ssl"]
+#use this for cpu offloading, for this you required to update the pyptoject.toml file as well
+CMD ["/app/moshi/.venv/bin/python", "-m", "moshi.server", "--ssl", "/app/ssl", "--device", "cpu", "--cpu-offload"]
