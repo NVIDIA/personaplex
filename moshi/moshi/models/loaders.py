@@ -193,9 +193,11 @@ def get_moshi_lm(
             filename, copy_missing_weights, device, dtype, lm_kwargs
         )
 
-    model = LMModel(device=device, dtype=dtype, **lm_kwargs).to(device=device, dtype=dtype)
-
+    # Init with meta device to avoid init dummy memory
+    init_device = "meta" if filename is not None else device
+    model = LMModel(device=init_device, dtype=dtype, **lm_kwargs)
     if filename is None:
+        model.to(device=device, dtype=dtype)
         model.eval()
         return model
 
@@ -213,7 +215,6 @@ def get_moshi_lm(
         # torch checkpoint
         with open(filename, "rb") as f:
             state_dict = torch.load(f, map_location="cpu")
-
     # Patch 1: expand depformer self_attn weights if needed
     model_sd = model.state_dict()
     for name, tensor in list(state_dict.items()):
@@ -249,10 +250,14 @@ def get_moshi_lm(
             if not replaced:
                 print("Missing %s", name)
 
+    # Assign weights to target device
+    dev = torch.device(device) if isinstance(device, str) else device
+    for key in state_dict:
+        state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
+    
     model.load_state_dict(state_dict, strict=False, assign=True)
-    model.to(device)
     model.eval()
-    return model
+    return model.to(device=device, dtype=dtype)
 
 
 def _get_moshi_lm_with_offload(
