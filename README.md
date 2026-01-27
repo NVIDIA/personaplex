@@ -258,6 +258,30 @@ curl http://localhost:8998/api/voices
 
 Returns JSON with all voices, their types, and categories.
 
+## Example Usage
+
+### Auto-Detection
+```bash
+# Build frontend
+cd client && npm run build && cd ..
+
+# Server auto-detects - no flag needed!
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR"
+# Logs: "Found custom UI at .../client/dist, using it instead of default"
+```
+
+### Custom Voices
+```bash
+# Add voice file
+cp my_voice.wav custom_voices/
+
+# Generate embeddings
+python -m moshi.offline --voice-prompt "my_voice.wav" \
+  --save-voice-embeddings --input-wav "assets/test/input_assistant.wav" --output-wav "/tmp/out.wav"
+
+# Restart server - voice appears in UI automatically!
+```
+
 ## Prompting Guide
 
 The model is trained on synthetic conversations for a fixed assistant role and varying customer service roles.
