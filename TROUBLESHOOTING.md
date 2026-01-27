@@ -214,12 +214,15 @@ If you modified React components but don't see changes:
 
 If models fail to download:
 
-1. Create a `.env` file in the repository root
-2. Add your HuggingFace token:
+1. Set your HuggingFace token as an environment variable:
+   ```bash
+   export HF_TOKEN=your_token_here
    ```
-   HF_TOKEN=your_token_here
+2. Or use the Hugging Face CLI:
+   ```bash
+   pip install huggingface_hub
+   huggingface-cli login
    ```
-3. See `.env.example` for more details
 
 ### ffmpeg Not Found
 

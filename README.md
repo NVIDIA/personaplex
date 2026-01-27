@@ -74,25 +74,16 @@ Log in to your Huggingface account and accept the PersonaPlex model license [her
 
 Then set up your Huggingface authentication using one of these methods:
 
-**Option 1: Using .env file (Recommended)**
-```bash
-# Copy the template and add your token
-cp .env.example .env
-# Edit .env and replace 'your_token_here' with your actual token
-```
-
-**Option 2: Environment variable**
+**Option 1: Environment variable**
 ```bash
 export HF_TOKEN=<YOUR_HUGGINGFACE_TOKEN>
 ```
 
-**Option 3: Hugging Face CLI**
+**Option 2: Hugging Face CLI**
 ```bash
 pip install huggingface_hub
 huggingface-cli login
 ```
-
-**Note:** The .env file is optional. All existing workflows continue to work.
 
 ### Launch Server
 
@@ -105,7 +96,6 @@ conda activate personaplex
 
 The server **automatically detects and serves your custom UI** if `client/dist` exists:
 ```bash
-# The server automatically loads your HF_TOKEN from the .env file
 # If client/dist exists, it will be used automatically!
 SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR"
 ```
@@ -248,8 +238,8 @@ cp my_voice.wav custom_voices/
 
 **Configure custom location (optional):**
 ```bash
-# In .env file
-CUSTOM_VOICE_DIR=/path/to/my/voices
+# Set environment variable
+export CUSTOM_VOICE_DIR=/path/to/my/voices
 ```
 
 #### Voice File Formats
