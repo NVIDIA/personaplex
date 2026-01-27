@@ -1,5 +1,43 @@
 # Troubleshooting Guide
 
+## Common Issues
+
+### Module Not Found: 'moshi'
+
+**Symptom:** When running `python -m moshi.server`, you get:
+```
+ModuleNotFoundError: No module named 'moshi'
+```
+
+**Root Cause:** The conda environment is not activated, or moshi is not installed in the active environment.
+
+**Solution:**
+
+1. Activate the conda environment:
+   ```bash
+   conda activate personaplex
+   ```
+
+2. Verify the environment is active (you should see `(personaplex)` in your prompt):
+   ```bash
+   conda info --envs
+   # Should show * next to personaplex
+   ```
+
+3. If moshi is not installed, install it:
+   ```bash
+   cd moshi
+   pip install -e .
+   cd ..
+   ```
+
+4. Try running the server again:
+   ```bash
+   SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR"
+   ```
+
+**Prevention:** Always activate the conda environment before running PersonaPlex commands. Add a reminder to your workflow or shell configuration.
+
 ## Development Issues
 
 ### Code Changes Not Reflected When Running Server
@@ -44,6 +82,65 @@
 **Prevention:** Always use `pip install -e .` (with the `-e` flag) when installing packages for development.
 
 ## Server Issues
+
+### Custom UI Not Loading (Server Uses Default UI)
+
+**Symptom:** You've modified the frontend (client/ directory), rebuilt it, but when you start the server, your changes don't appear.
+
+**Root Cause:** The `client/dist` directory doesn't exist or is empty. The server auto-detects custom UI by checking if `client/dist` exists.
+
+**Solution:**
+
+1. **Verify the build exists:**
+   ```bash
+   ls -la client/dist/
+   ```
+   If this directory doesn't exist or is empty, you need to build the frontend first.
+
+2. **Build the frontend:**
+   ```bash
+   cd client
+   npm install  # If you haven't already
+   npm run build
+   cd ..
+   ```
+
+3. **Restart the server** (it will now auto-detect the custom UI):
+   ```bash
+   conda activate personaplex
+   SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR"
+   ```
+
+4. **Verify auto-detection worked** by checking the logs:
+   ```
+   # SUCCESS - Custom UI detected:
+   Found custom UI at .../client/dist, using it instead of default
+   static_path = /home/.../personaplex-blackwell/client/dist
+
+   # FAIL - No custom UI found:
+   retrieving the static content
+   static_path = /home/.../.cache/huggingface/.../dist
+   ```
+
+5. Hard refresh your browser (Ctrl+Shift+R or Cmd+Shift+R) to clear cached assets
+
+**When auto-detection won't work:**
+- `client/dist` directory doesn't exist
+- `client/dist` exists but is empty
+- Permissions prevent reading the directory
+
+**Manual override (if needed):**
+If auto-detection fails but you know the build exists, use the `--static` flag:
+```bash
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --static client/dist
+```
+
+**Development tip:**
+After making frontend changes, rebuild and the server will auto-detect:
+```bash
+cd client && npm run build && cd ..
+# Restart server - custom UI detected automatically!
+```
 
 ### Server Returns 404 for API Endpoints
 

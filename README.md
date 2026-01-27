@@ -5,6 +5,10 @@
 [![Demo](https://img.shields.io/badge/🎮-Demo-green)](https://research.nvidia.com/labs/adlr/personaplex/)
 [![Discord](https://img.shields.io/badge/Discord-Join-purple?logo=discord)](https://discord.gg/5jAXrrbwRb)
 
+**🚀 New to PersonaPlex? See [QUICKSTART.md](QUICKSTART.md) for a fast setup guide!**
+
+**🎨 Developing custom UI? See [FRONTEND_DEVELOPMENT.md](FRONTEND_DEVELOPMENT.md) for frontend development workflow!**
+
 PersonaPlex is a real-time, full-duplex speech-to-speech conversational model that enables persona control through text-based role prompts and audio-based voice conditioning. Trained on a combination of synthetic and real conversations, it produces natural, low-latency spoken interactions with a consistent persona. PersonaPlex is based on the [Moshi](https://arxiv.org/abs/2410.00037) architecture and weights.
 
 <p align="center">
@@ -48,13 +52,13 @@ cd ..
 **Note:** Use `pip install -e .` (editable mode) during development so code changes are immediately reflected without reinstalling.
 
 #### Option 2: For Blackwell GPUs (RTX 50 series)
-Blackwell GPUs require PyTorch with CUDA 12.8. Install PyTorch first, then the moshi package:
+Blackwell GPUs require PyTorch with CUDA 13.0+ support. Install PyTorch first, then the moshi package:
 ```bash
 # Create and activate conda environment
 conda create -n personaplex python=3.10 -y
 conda activate personaplex
 
-# Install PyTorch with CUDA 13.0 FIRST
+# Install PyTorch with CUDA 13.0+ support FIRST (required for Blackwell)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 
 # Then install the moshi package (will use existing PyTorch)
@@ -92,15 +96,47 @@ huggingface-cli login
 
 ### Launch Server
 
-Launch server for live interaction (temporary SSL certs for https):
+**IMPORTANT: First activate the conda environment:**
+```bash
+conda activate personaplex
+```
+
+#### Smart Auto-Detection (Recommended)
+
+The server **automatically detects and serves your custom UI** if `client/dist` exists:
 ```bash
 # The server automatically loads your HF_TOKEN from the .env file
+# If client/dist exists, it will be used automatically!
 SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR"
 ```
 
-**For Development:** If you've modified the frontend (client/ directory), use the `--static` flag to serve your local build:
+**Auto-detection behavior:**
+1. Checks if `client/dist` exists in your project
+2. If yes → serves custom UI from `./client/dist`
+3. If no → downloads and serves default UI from HuggingFace
+
+**How to verify which UI is loading:**
+Check the server logs:
+- **Custom UI (auto-detected)**:
+  ```
+  Found custom UI at .../client/dist, using it instead of default
+  static_path = /home/.../personaplex-blackwell/client/dist
+  ```
+- **Default UI (no custom build)**:
+  ```
+  retrieving the static content
+  static_path = /home/.../.cache/huggingface/.../dist
+  ```
+
+#### Manual Override (Optional)
+
+You can still explicitly specify which UI to use with the `--static` flag:
 ```bash
+# Force use of custom UI from specific directory
 SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --static client/dist
+
+# Disable static serving entirely
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --static none
 ```
 
 **CPU Offload:** If your GPU has insufficient memory, use the `--cpu-offload` flag to offload model layers to CPU. This requires the `accelerate` package (`pip install accelerate`):

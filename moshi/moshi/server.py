@@ -353,8 +353,51 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
     return str(voices_dir)
 
 
+def _is_valid_ui_build(dist_path: Path) -> bool:
+    """
+    Validate that a directory contains a valid UI build.
+
+    Args:
+        dist_path: Path to the dist directory
+
+    Returns:
+        True if the directory contains a valid build (has index.html), False otherwise
+    """
+    if not dist_path.is_dir():
+        return False
+
+    # Check for essential file - index.html must exist and be non-empty
+    index_html = dist_path / "index.html"
+    try:
+        return index_html.exists() and index_html.stat().st_size > 0
+    except (OSError, PermissionError):
+        return False
+
+
 def _get_static_path(static: Optional[str]) -> Optional[str]:
     if static is None:
+        # Auto-detect: prefer local custom UI (client/dist) if it exists
+        try:
+            # Priority 1: Check current working directory (works for all install modes)
+            cwd_dist = Path.cwd() / "client" / "dist"
+            if _is_valid_ui_build(cwd_dist):
+                logger.info(f"Found custom UI at {cwd_dist}, using it instead of default")
+                return str(cwd_dist)
+
+            # Priority 2: Check project root relative to __file__ (works for editable installs)
+            # server.py is in moshi/moshi/, so project root is 2 levels up
+            project_root = Path(__file__).parent.parent.parent
+            local_dist = project_root / "client" / "dist"
+
+            if _is_valid_ui_build(local_dist):
+                logger.info(f"Found custom UI at {local_dist}, using it instead of default")
+                return str(local_dist)
+
+        except (OSError, PermissionError) as e:
+            logger.warning(f"Could not check for custom UI: {e}. Falling back to default.")
+            # Fall through to HuggingFace download
+
+        # Fall back to HuggingFace default UI
         logger.info("retrieving the static content")
         dist_tgz = hf_hub_download("nvidia/personaplex-7b-v1", "dist.tgz")
         dist_tgz = Path(dist_tgz)
