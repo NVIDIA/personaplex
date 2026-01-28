@@ -1,1 +1,3 @@
-.cache
+.cache/
+moshi/build/
+moshi/*egg-info/
