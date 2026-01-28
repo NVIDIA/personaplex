@@ -459,7 +459,6 @@ class LMModel(StreamingContainer):
         depformer_cb_index: int,
         sequence: torch.Tensor,
         transformer_out: torch.Tensor,
-        skip_transfer: bool = False,
     ) -> torch.Tensor:
         B, K, S = sequence.shape
         assert (

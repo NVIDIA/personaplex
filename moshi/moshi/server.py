@@ -218,7 +218,6 @@ class ServerState:
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
                 while all_pcm_data.shape[-1] >= self.frame_size:
-                    frame_start = time.time()
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
                     chunk = torch.from_numpy(chunk)
@@ -230,9 +229,9 @@ class ServerState:
                     encode_time = time.time() - t0
 
                     for c in range(codes.shape[-1]):
-                        t1 = time.time()
+                        step_start = time.time()
                         tokens = self.lm_gen.step(codes[:, :, c: c + 1])
-                        lm_time = time.time() - t1
+                        lm_time = time.time() - step_start
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
@@ -242,9 +241,9 @@ class ServerState:
                         _ = self.other_mimi.decode(tokens[:, 1:9])
                         decode_time = time.time() - t2
 
-                        frame_total = time.time() - frame_start
-                        if frame_total > 0.08:  # Exceeded 80ms budget
-                            clog.log("warning", f"Frame exceeded budget: total={frame_total*1000:.1f}ms "
+                        step_total = time.time() - step_start
+                        if step_total > 0.08:  # Exceeded 80ms budget
+                            clog.log("warning", f"Step exceeded budget: total={step_total*1000:.1f}ms "
                                      f"(encode={encode_time*1000:.1f}, lm={lm_time*1000:.1f}, decode={decode_time*1000:.1f})")
                         main_pcm = main_pcm.cpu()
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
@@ -391,7 +390,7 @@ def main():
                              "Requires 'accelerate' package.")
     parser.add_argument("--multi-gpu", action="store_true",
                         help="Distribute model layers across all available GPUs (pipeline parallelism). "
-                             "Requires 'accelerate' package. Run with NO_CUDA_GRAPH=1 for stability.")
+                             "Requires at least 2 GPUs.")
     parser.add_argument("--gpus", type=int, default=None,
                         help="Limit the number of GPUs to use when --multi-gpu is enabled.")
     parser.add_argument(
@@ -463,7 +462,10 @@ def main():
     logger.info("loading moshi")
     if args.moshi_weight is None:
         args.moshi_weight = hf_hub_download(args.hf_repo, loaders.MOSHI_NAME)
-    lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload, multi_gpu=args.multi_gpu, gpus=args.gpus)
+    lm = loaders.get_moshi_lm(
+        args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload,
+        multi_gpu=args.multi_gpu, gpus=args.gpus,
+    )
     lm.eval()
     logger.info("moshi loaded")
     state = ServerState(

@@ -301,8 +301,10 @@ class CUDAGraphed:
                 if self._graph is None:
                     if self.warmup_steps <= 0:
                         # For multi-GPU: create stream explicitly on target device
-                        # and synchronize to ensure all pending transfers are complete.
-                        # This fixes "CUDA Graph is empty" warnings on secondary GPUs.
+                        # and synchronize to ensure all pending non-blocking transfers
+                        # are complete before capture. Without this, the capture stream
+                        # may have no work queued yet, producing "CUDA Graph is empty"
+                        # warnings on secondary GPUs.
                         if device is not None:
                             capture_stream = cuda.Stream(device=device)
                             cuda.current_stream(device).synchronize()
