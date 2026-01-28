@@ -29,7 +29,7 @@ to fully deactivate it easily with a context manager.
 Provides a simple activation checkpointing that is compatible with FSDP and torch compile.
 Finally, provides some utilities for CUDA graphing functions.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 import inspect
 import os
@@ -207,6 +207,18 @@ def no_cuda_graph():
         _disable_cuda_graph = old_value
 
 
+def _get_device_from_args(args: tuple) -> torch.device | None:
+    """Get the CUDA device from the first tensor argument.
+
+    This is used for multi-GPU support to ensure CUDA graphs are created
+    and captured on the correct device where tensors actually live.
+    """
+    for arg in args:
+        if isinstance(arg, torch.Tensor) and arg.device.type == 'cuda':
+            return arg.device
+    return None
+
+
 class CUDAGraphed:
     """Allow simple CUDA Graphing of a function.
 
@@ -279,26 +291,41 @@ class CUDAGraphed:
                         )
 
         with _set_in_cuda_graph():
-            # Prevent any one under us to try and CUDA Graph things.
-            if self._graph is None:
-                if self.warmup_steps <= 0:
-                    self._graph = cuda.CUDAGraph()
-                    # Making a copy just to ensure those are not used else where.
-                    self._args = _clone_tensors(args)
-                    with cuda.graph(self._graph):
-                        self._output = self.func(*self._args)
-                    # At this point nothing really happened, so we have to make it run for real.
+            # Detect device from input tensors for multi-GPU support.
+            # This ensures CUDA graphs are created/captured on the correct device.
+            device = _get_device_from_args(args)
+            device_ctx = torch.cuda.device(device) if device is not None else nullcontext()
+
+            with device_ctx:
+                # Prevent any one under us to try and CUDA Graph things.
+                if self._graph is None:
+                    if self.warmup_steps <= 0:
+                        # For multi-GPU: create stream explicitly on target device
+                        # and synchronize to ensure all pending transfers are complete.
+                        # This fixes "CUDA Graph is empty" warnings on secondary GPUs.
+                        if device is not None:
+                            capture_stream = cuda.Stream(device=device)
+                            cuda.current_stream(device).synchronize()
+                        else:
+                            capture_stream = None
+
+                        self._graph = cuda.CUDAGraph()
+                        # Making a copy just to ensure those are not used else where.
+                        self._args = _clone_tensors(args)
+                        with cuda.graph(self._graph, stream=capture_stream):
+                            self._output = self.func(*self._args)
+                        # At this point nothing really happened, so we have to make it run for real.
+                        self._graph.replay()
+                        return self._output
+                    else:
+                        self.warmup_steps -= 1
+                        return self.func(*args)
+                else:
+                    assert self._args is not None
+                    assert self._output is not None
+                    _match_values_copy_tensors(args, self._args)
                     self._graph.replay()
                     return self._output
-                else:
-                    self.warmup_steps -= 1
-                    return self.func(*args)
-            else:
-                assert self._args is not None
-                assert self._output is not None
-                _match_values_copy_tensors(args, self._args)
-                self._graph.replay()
-                return self._output
 
 
 def cuda_graph(func: tp.Callable, warmup_steps: int = 1):

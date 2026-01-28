@@ -459,6 +459,7 @@ class LMModel(StreamingContainer):
         depformer_cb_index: int,
         sequence: torch.Tensor,
         transformer_out: torch.Tensor,
+        skip_transfer: bool = False,
     ) -> torch.Tensor:
         B, K, S = sequence.shape
         assert (
@@ -715,11 +716,16 @@ class LMGen(StreamingModule[_LMGenState]):
             dtype=torch.bool
         )
 
-        disable = lm_model.device.type != 'cuda'
-        # disable = True # DEBUG
-        graphed_main = CUDAGraphed(lm_model.forward_codes, disable=disable)
-        graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable)
-        graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
+        # Disable CUDA graphs for multi-GPU mode for main transformer
+        # forward_codes/forward_embeddings transfer tensors between devices (cross-stream
+        # dependencies that cannot be captured in a CUDA graph - cudaErrorStreamCaptureIsolation)
+        is_multi_gpu = getattr(lm_model, '_is_multi_gpu', False)
+        disable_cross_device = lm_model.device.type != 'cuda' or is_multi_gpu
+        graphed_main = CUDAGraphed(lm_model.forward_codes, disable=disable_cross_device)
+        graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable_cross_device)
+        # Depformer can be graphed in multi-GPU mode because we pre-transfer inputs
+        # to the depformer device BEFORE calling the graphed function (see process_transformer_output)
+        graphed_depth = CUDAGraphed(self.depformer_step, disable=lm_model.device.type != 'cuda')
 
         return _LMGenState(cache, provided, initial, graphed_main, graphed_embeddings, graphed_depth)
     
@@ -891,10 +897,24 @@ class LMGen(StreamingModule[_LMGenState]):
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 
+        # Pre-transfer inputs to depformer device for CUDA graph compatibility in multi-GPU mode.
+        # Device transfers (.to()) cannot be captured in CUDA graphs, so we do them outside
+        # the graphed function. The graphed depformer_step then operates on a single device.
+        depformer_device = getattr(lm_model, '_depformer_device', lm_model.device)
+        transformer_out_dep = transformer_out.to(depformer_device, non_blocking=True)
+        target_dep = target_[:, lm_model.audio_offset:, 0].to(depformer_device, non_blocking=True)
+        provided_dep = provided_[:, lm_model.audio_offset:, 0].to(depformer_device, non_blocking=True)
+        next_text_token_dep = next_text_token.to(depformer_device, non_blocking=True)
+
         if self.return_logits:
-            sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]
+            sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token_dep, transformer_out_dep, target_dep, provided_dep) # [B, K_audio, Card_audio]
         else:
-            sampled_audio_tokens = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0])
+            sampled_audio_tokens = state.graphed_depth(next_text_token_dep, transformer_out_dep, target_dep, provided_dep)
+
+        # Transfer result back to primary device for cache storage
+        sampled_audio_tokens = sampled_audio_tokens.to(lm_model.device, non_blocking=True)
+        if self.return_logits:
+            audio_logits = audio_logits.to(lm_model.device, non_blocking=True)
 
         state.provided[:, :, model_input_position] = False
         ####
@@ -1133,6 +1153,12 @@ class LMGen(StreamingModule[_LMGenState]):
         audio_tokens: torch.Tensor,
         audio_provided: torch.Tensor
     ) -> torch.Tensor:
+        """Run depformer inference loop.
+
+        Inputs should already be on the depformer device (transferred by caller in
+        process_transformer_output). This allows CUDA graph capture in multi-GPU mode
+        since no cross-device transfers occur within this function.
+        """
         (B,) = text_token.shape
         prev_token = text_token
         lm_model = self.lm_model
@@ -1142,7 +1168,8 @@ class LMGen(StreamingModule[_LMGenState]):
         with lm_model.depformer.streaming(B):
             for cb_index in range(lm_model.dep_q):
                 input_ = prev_token[:, None, None]
-                logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
+                # skip_transfer=True because inputs are pre-transferred to depformer device
+                logits = lm_model.forward_depformer(cb_index, input_, transformer_out, skip_transfer=True)
                 if self.return_logits:
                     assert logits.shape == (B, 1, 1, lm_model.card), logits.shape
                     ret_logits = logits.squeeze(dim=1).squeeze(dim=1)
