@@ -17,7 +17,10 @@ PersonaPlex is a real-time, full-duplex speech-to-speech conversational model th
 
 ### Prerequisites
 
-Install the [Opus audio codec](https://github.com/xiph/opus) development library:
+1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/)
+
+2. Install the [Opus audio codec](https://github.com/xiph/opus) development library:
+
 ```bash
 # Ubuntu/Debian
 sudo apt install libopus-dev
@@ -33,12 +36,13 @@ brew install opus
 
 Download this repository and install with:
 ```bash
-pip install moshi/.
+cd moshi
+uv sync
 ```
 
 Extra step for Blackwell based GPUs as suggested in (See https://github.com/NVIDIA/personaplex/issues/2):
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+uv sync --extra cu130
 ```
 
 
@@ -53,12 +57,12 @@ export HF_TOKEN=<YOUR_HUGGINGFACE_TOKEN>
 
 Launch server for live interaction (temporary SSL certs for https):
 ```bash
-SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR"
+SSL_DIR=$(mktemp -d); uv run moshi-server --ssl "$SSL_DIR"
 ```
 
 **CPU Offload:** If your GPU has insufficient memory, use the `--cpu-offload` flag to offload model layers to CPU. This requires the `accelerate` package (`pip install accelerate`):
 ```bash
-SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --cpu-offload
+SSL_DIR=$(mktemp -d); uv run moshi-server --ssl "$SSL_DIR" --cpu-offload
 ```
 
 Access the Web UI from a browser at `localhost:8998` if running locally, otherwise look for the access link printed by the script:
@@ -75,7 +79,7 @@ Add `--cpu-offload` to any command below if your GPU has insufficient memory (re
 **Assistant example:**
 ```bash
 HF_TOKEN=<TOKEN> \
-python -m moshi.offline \
+uv run moshi-offline \
   --voice-prompt "NATF2.pt" \
   --input-wav "assets/test/input_assistant.wav" \
   --seed 42424242 \
@@ -86,7 +90,7 @@ python -m moshi.offline \
 **Service example:**
 ```bash
 HF_TOKEN=<TOKEN> \
-python -m moshi.offline \
+uv run moshi-offline \
   --voice-prompt "NATM1.pt" \
   --text-prompt "$(cat assets/test/prompt_service.txt)" \
   --input-wav "assets/test/input_service.wav" \
