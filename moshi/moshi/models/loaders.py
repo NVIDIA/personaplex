@@ -155,7 +155,8 @@ def get_mimi(filename: str | Path,
     ).to(device=device)
     model.eval()
     if _is_safetensors(filename):
-        load_model(model, filename)
+        state_dict = load_file(filename, device=str(device))
+        model.load_state_dict(state_dict, strict=False, assign=True)
     else:
         pkg = torch.load(filename, "cpu")
         model.load_state_dict(pkg["model"])

@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import {useLocalStorage} from './useLocalStorage';
+import { useLocalStorage } from './useLocalStorage';
 
 export const DEFAULT_TEXT_TEMPERATURE = 0.7;
 export const DEFAULT_TEXT_TOPK = 25;
@@ -27,17 +27,17 @@ export type ModelParamsValues = {
 
 type useModelParamsArgs = Partial<ModelParamsValues>;
 
-export const useModelParams = (params?:useModelParamsArgs) => {
+export const useModelParams = (params?: useModelParamsArgs) => {
 
   const [textTemperature, setTextTemperatureBase] = useState(params?.textTemperature || DEFAULT_TEXT_TEMPERATURE);
-  const [textTopk, setTextTopkBase]= useState(params?.textTopk || DEFAULT_TEXT_TOPK);
+  const [textTopk, setTextTopkBase] = useState(params?.textTopk || DEFAULT_TEXT_TOPK);
   const [audioTemperature, setAudioTemperatureBase] = useState(params?.audioTemperature || DEFAULT_AUDIO_TEMPERATURE);
   const [audioTopk, setAudioTopkBase] = useState(params?.audioTopk || DEFAULT_AUDIO_TOPK);
   const [padMult, setPadMultBase] = useState(params?.padMult || DEFAULT_PAD_MULT);
   const [repetitionPenalty, setRepetitionPenaltyBase] = useState(params?.repetitionPenalty || DEFAULT_REPETITION_PENALTY);
   const [repetitionPenaltyContext, setRepetitionPenaltyContextBase] = useState(params?.repetitionPenaltyContext || DEFAULT_REPETITION_PENALTY_CONTEXT);
   const [textPrompt, setTextPromptBase] = useState(params?.textPrompt || DEFAULT_TEXT_PROMPT);
-  const [voicePrompt, setVoicePromptBase] = useState(params?.voicePrompt || DEFAULT_VOICE_PROMPT);
+  const [voicePrompt, setVoicePromptBase] = useLocalStorage('voicePrompt', params?.voicePrompt || DEFAULT_VOICE_PROMPT);
   const [randomSeed, setRandomSeedBase] = useLocalStorage('randomSeed', params?.randomSeed || DEFAULT_RANDOM_SEED);
 
   const resetParams = useCallback(() => {
@@ -83,37 +83,37 @@ export const useModelParams = (params?:useModelParamsArgs) => {
   ]);
 
   const setTextTemperature = useCallback((value: number) => {
-    if(value <= 1.2 || value >= 0.2) {
+    if (value <= 1.2 || value >= 0.2) {
       setTextTemperatureBase(value);
     }
   }, []);
   const setTextTopk = useCallback((value: number) => {
-    if(value <= 500 || value >= 10) {
+    if (value <= 500 || value >= 10) {
       setTextTopkBase(value);
     }
   }, []);
   const setAudioTemperature = useCallback((value: number) => {
-    if(value <= 1.2 || value >= 0.2) {
+    if (value <= 1.2 || value >= 0.2) {
       setAudioTemperatureBase(value);
     }
   }, []);
   const setAudioTopk = useCallback((value: number) => {
-    if(value <= 500 || value >= 10) {
+    if (value <= 500 || value >= 10) {
       setAudioTopkBase(value);
     }
   }, []);
   const setPadMult = useCallback((value: number) => {
-    if(value <= 4 || value >= -4) {
+    if (value <= 4 || value >= -4) {
       setPadMultBase(value);
     }
   }, []);
   const setRepetitionPenalty = useCallback((value: number) => {
-    if(value <= 2.0 || value >= 1.0) {
+    if (value <= 2.0 || value >= 1.0) {
       setRepetitionPenaltyBase(value);
     }
   }, []);
   const setRepetitionPenaltyContext = useCallback((value: number) => {
-    if(value <= 200|| value >= 0) {
+    if (value <= 200 || value >= 0) {
       setRepetitionPenaltyContextBase(value);
     }
   }, []);

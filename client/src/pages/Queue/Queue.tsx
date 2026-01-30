@@ -9,6 +9,7 @@ import { env } from "../../env";
 import { prewarmDecoderWorker } from "../../decoder/decoderWorker";
 
 const VOICE_OPTIONS = [
+  "pepper.pt",
   "NATF0.pt", "NATF1.pt", "NATF2.pt", "NATF3.pt",
   "NATM0.pt", "NATM1.pt", "NATM2.pt", "NATM3.pt",
   "VARF0.pt", "VARF1.pt", "VARF2.pt", "VARF3.pt", "VARF4.pt",
@@ -113,19 +114,19 @@ const Homepage = ({
               </option>
             ))}
           </select>
-      </div>
+        </div>
 
         {showMicrophoneAccessMessage && (
           <p className="text-center text-red-500">Please enable your microphone before proceeding</p>
         )}
-        
+
         <Button onClick={async () => await startConnection()}>Connect</Button>
-    </div>
+      </div>
     </div>
   );
 }
 
-export const Queue:FC = () => {
+export const Queue: FC = () => {
   const theme = "light" as const;  // Always use light theme
   const [searchParams] = useSearchParams();
   const overrideWorkerAddr = searchParams.get("worker_addr");
@@ -135,14 +136,14 @@ export const Queue:FC = () => {
 
   const audioContext = useRef<AudioContext | null>(null);
   const worklet = useRef<AudioWorkletNode | null>(null);
-  
+
   // enable eruda in development
   useEffect(() => {
-    if(env.VITE_ENV === "development") {
+    if (env.VITE_ENV === "development") {
       eruda.init();
     }
     () => {
-      if(env.VITE_ENV === "development") {
+      if (env.VITE_ENV === "development") {
         eruda.destroy();
       }
     };
@@ -153,22 +154,22 @@ export const Queue:FC = () => {
       await window.navigator.mediaDevices.getUserMedia({ audio: true });
       setHasMicrophoneAccess(true);
       return true;
-    } catch(e) {
+    } catch (e) {
       console.error(e);
       setShowMicrophoneAccessMessage(true);
       setHasMicrophoneAccess(false);
     }
     return false;
-}, [setHasMicrophoneAccess, setShowMicrophoneAccessMessage]);
+  }, [setHasMicrophoneAccess, setShowMicrophoneAccessMessage]);
 
   const startProcessor = useCallback(async () => {
-    if(!audioContext.current) {
+    if (!audioContext.current) {
       audioContext.current = new AudioContext();
       // Prewarm decoder worker as soon as we have audio context
       // This gives WASM time to load while user grants mic access
       prewarmDecoderWorker(audioContext.current.sampleRate);
     }
-    if(worklet.current) {
+    if (worklet.current) {
       return;
     }
     let ctx = audioContext.current;
@@ -182,10 +183,10 @@ export const Queue:FC = () => {
     worklet.current.connect(ctx.destination);
   }, [audioContext, worklet]);
 
-  const startConnection = useCallback(async() => {
-      await startProcessor();
-      const hasAccess = await getMicrophoneAccess();
-      if (hasAccess) {
+  const startConnection = useCallback(async () => {
+    await startProcessor();
+    const hasAccess = await getMicrophoneAccess();
+    if (hasAccess) {
       // Values are already set in modelParams, they get passed to Conversation
     }
   }, [startProcessor, getMicrophoneAccess]);
@@ -194,12 +195,12 @@ export const Queue:FC = () => {
     <>
       {(hasMicrophoneAccess && audioContext.current && worklet.current) ? (
         <Conversation
-        workerAddr={overrideWorkerAddr ?? ""}
-        audioContext={audioContext as MutableRefObject<AudioContext|null>}
-        worklet={worklet as MutableRefObject<AudioWorkletNode|null>}
-        theme={theme}
-        startConnection={startConnection}
-        {...modelParams}
+          workerAddr={overrideWorkerAddr ?? env.VITE_QUEUE_API_URL ?? ""}
+          audioContext={audioContext as MutableRefObject<AudioContext | null>}
+          worklet={worklet as MutableRefObject<AudioWorkletNode | null>}
+          theme={theme}
+          startConnection={startConnection}
+          {...modelParams}
         />
       ) : (
         <Homepage

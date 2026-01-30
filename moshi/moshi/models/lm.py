@@ -110,8 +110,13 @@ def normalize_audio(wav: np.ndarray, sr: int, target_lufs: float) -> np.ndarray:
     """Normalize **mono** audio to a target LUFS level."""
     import pyloudnorm as pyln
     # Ensure shape is (T,)
-    if wav.ndim == 2 and wav.shape[0] == 1:
-        wav = wav[0]
+    if wav.ndim == 2:
+        if wav.shape[0] <= 5:
+            # Channels-first (C, T), average to mono
+            wav = np.mean(wav, axis=0)
+        else:
+            # Channels-last (T, C), take first channel or average
+            wav = np.mean(wav, axis=1)
 
     meter = pyln.Meter(sr)
     loudness = meter.integrated_loudness(wav)
@@ -976,7 +981,7 @@ class LMGen(StreamingModule[_LMGenState]):
 
     def load_voice_prompt_embeddings(self, path: str):
         self.voice_prompt = path
-        state = torch.load(path)
+        state = torch.load(path, map_location='cpu')
 
         self.voice_prompt_audio = None
         self.voice_prompt_embeddings = state["embeddings"].to(self.lm_model.device)
@@ -1010,8 +1015,12 @@ class LMGen(StreamingModule[_LMGenState]):
     def _step_voice_prompt_frame(self,
                                  voice_prompt_frame_tokens: torch.Tensor,
                                  saved_embeddings: Optional[list[torch.Tensor]]=None,
+                                 step_idx: int = 0,
+                                 total_steps: int = 0,
                                  ):
         # Always use zero_text_code during voice prompt
+        if step_idx % 10 == 0:
+            print(f"DEBUG: System prompt step {step_idx}/{total_steps}...")
         out = self.step(
             moshi_tokens=voice_prompt_frame_tokens,
             text_token=self.zero_text_code,
@@ -1040,11 +1049,15 @@ class LMGen(StreamingModule[_LMGenState]):
 
         elif self.voice_prompt_audio is not None:
             saved_embeddings = []
-            for voice_prompt_frame_tokens in self._encode_voice_prompt_frames(mimi):
+            frames = list(self._encode_voice_prompt_frames(mimi))
+            total_steps = len(frames)
+            for i, voice_prompt_frame_tokens in enumerate(frames):
                 yield
                 self._step_voice_prompt_frame(
                     voice_prompt_frame_tokens,
-                    saved_embeddings
+                    saved_embeddings,
+                    step_idx=i,
+                    total_steps=total_steps
                 )
             # One last checkpoint before any optional save (nice-to-have for async disconnect)
             yield
@@ -1094,6 +1107,8 @@ class LMGen(StreamingModule[_LMGenState]):
                 break
 
     def _step_text_prompt_core(self) -> Iterator[None]:
+        if self.text_prompt_tokens is None:
+            return
         for text_prompt_token in self.text_prompt_tokens:
             yield
             self.step(

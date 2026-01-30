@@ -138,6 +138,7 @@ class ServerState:
         clog = ColorizedLog.randomize()
         peer = request.remote  # IP
         peer_port = request.transport.get_extra_info("peername")[1]  # Port
+        print(f"DEBUG: Incoming connection from {peer}:{peer_port}", flush=True)
         clog.log("info", f"Incoming connection from {peer}:{peer_port}")
 
         # self.lm_gen.temp = float(request.query["audio_temperature"])
@@ -240,6 +241,10 @@ class ServerState:
                             await ws.send_bytes(msg)
                         else:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+                    
+                    af = time.time()
+                    if int(af) % 10 == 0:
+                        logger.info(f"DEBUG: Processed 1 audio frame in {af - be:.2f}s (Target: 0.08s)")
 
         async def send_loop():
             while True:
@@ -280,11 +285,15 @@ class ServerState:
                     return False
                 return True
             # Reuse mimi for encoding voice prompt and then reset it before conversation starts
+            print("DEBUG: Starting system prompts (CPU)...", flush=True)
+            logger.info("Starting system prompts (this may take a while on CPU)...")
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
             self.mimi.reset_streaming()
-            clog.log("info", "done with system prompts")
+            print("DEBUG: Done with system prompts.", flush=True)
+            logger.info("Done with system prompts.")
             # Send the handshake.
             if await is_alive():
+                print("DEBUG: Sending handshake to client...", flush=True)
                 await ws.send_bytes(b"\x00")
                 clog.log("info", "sent handshake bytes")
                 # Clean cancellation manager
@@ -479,5 +488,6 @@ def main():
     web.run_app(app, port=args.port, ssl_context=ssl_context)
 
 
-with torch.no_grad():
-    main()
+if __name__ == "__main__":
+    with torch.no_grad():
+        main()

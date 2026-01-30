@@ -11,7 +11,7 @@ export const useSocket = ({
   uri: string;
   onDisconnect?: () => void;
 }) => {
-  const lastMessageTime = useRef<null|number>(null);
+  const lastMessageTime = useRef<null | number>(null);
   const socketRef = useRef<WebSocket | null>(null); // useRef to keep stable socket reference
   const [socketStatus, setSocketStatus] = useState<SocketStatus>("disconnected");
 
@@ -84,20 +84,20 @@ export const useSocket = ({
   }, [uri, onMessage, onConnect, onDisconnect, onMessageEvent]);
 
   const stop = useCallback(() => {
-      if (socketRef.current) {
-        socketRef.current.close();
-        socketRef.current = null;
-      }
-      setSocketStatus("disconnected");
-      // if (onDisconnectProp) {
-      //   onDisconnectProp();
-      // }
-      // socket?.close();
-      // setSocket(null);
+    if (socketRef.current) {
+      socketRef.current.close();
+      socketRef.current = null;
+    }
+    setSocketStatus("disconnected");
+    // if (onDisconnectProp) {
+    //   onDisconnectProp();
+    // }
+    // socket?.close();
+    // setSocket(null);
   }, []);
 
   useEffect(() => {
-    if(socketStatus !== "connected") {
+    if (socketStatus !== "connected") {
       return;
     }
     const intervalId = setInterval(() => {

@@ -246,7 +246,7 @@ class RingKVCache:
         num_heads: int,
         dim_per_head: int,
         capacity: int,
-        device: torch.device = torch.device("cuda"),
+        device: torch.device = torch.device("cpu"),
         dtype: torch.dtype = torch.bfloat16,
     ):
         self.capacity = capacity

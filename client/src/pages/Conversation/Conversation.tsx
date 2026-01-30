@@ -21,8 +21,8 @@ type ConversationProps = {
   sessionId?: number;
   email?: string;
   theme: ThemeType;
-  audioContext: MutableRefObject<AudioContext|null>;
-  worklet: MutableRefObject<AudioWorkletNode|null>;
+  audioContext: MutableRefObject<AudioContext | null>;
+  worklet: MutableRefObject<AudioWorkletNode | null>;
   onConversationEnd?: () => void;
   isBypass?: boolean;
   startConnection: () => Promise<void>;
@@ -46,18 +46,38 @@ const buildURL = ({
 }) => {
   const newWorkerAddr = useMemo(() => {
     if (workerAddr == "same" || workerAddr == "") {
-      const newWorkerAddr = window.location.hostname + ":" + window.location.port;
-      console.log("Overriding workerAddr to", newWorkerAddr);
-      return newWorkerAddr;
+      const addr = window.location.hostname + ":" + window.location.port;
+      console.log("Overriding workerAddr to", addr);
+      return addr;
     }
     return workerAddr;
   }, [workerAddr]);
-  const wsProtocol = (window.location.protocol === 'https:') ? 'wss' : 'ws';
-  const url = new URL(`${wsProtocol}://${newWorkerAddr}/api/chat`);
-  if(workerAuthId) {
+
+  let url: URL;
+
+  if (newWorkerAddr.startsWith('ws://') || newWorkerAddr.startsWith('wss://') || newWorkerAddr.startsWith('http://') || newWorkerAddr.startsWith('https://')) {
+    // If it's a full URL, use it as is but ensure it's converted to ws/wss
+    const rawUrl = new URL(newWorkerAddr);
+    const protocol = (rawUrl.protocol === 'https:' || rawUrl.protocol === 'wss:') ? 'wss' : 'ws';
+    url = new URL(`${protocol}://${rawUrl.host}${rawUrl.pathname}`);
+    if (url.pathname === '/' || url.pathname === '') {
+      url.pathname = '/api/chat';
+    }
+  } else {
+    // Legacy host:port handling
+    const isRemote = newWorkerAddr.includes('.') &&
+      !newWorkerAddr.startsWith('127.') &&
+      !newWorkerAddr.startsWith('192.168.') &&
+      newWorkerAddr !== 'localhost';
+
+    const wsProtocol = (window.location.protocol === 'https:' || isRemote) ? 'wss' : 'ws';
+    url = new URL(`${wsProtocol}://${newWorkerAddr}/api/chat`);
+  }
+
+  if (workerAuthId) {
     url.searchParams.append("worker_auth_id", workerAuthId);
   }
-  if(email) {
+  if (email) {
     url.searchParams.append("email", email);
   }
   url.searchParams.append("text_temperature", params.textTemperature.toString());
@@ -71,12 +91,12 @@ const buildURL = ({
   url.searchParams.append("repetition_penalty", params.repetitionPenalty.toString());
   url.searchParams.append("text_prompt", params.textPrompt.toString());
   url.searchParams.append("voice_prompt", params.voicePrompt.toString());
-  console.log(url.toString());
+  console.log("Connecting to:", url.toString());
   return url.toString();
 };
 
 
-export const Conversation:FC<ConversationProps> = ({
+export const Conversation: FC<ConversationProps> = ({
   workerAddr,
   workerAuthId,
   audioContext,
@@ -85,7 +105,7 @@ export const Conversation:FC<ConversationProps> = ({
   sessionId,
   onConversationEnd,
   startConnection,
-  isBypass=false,
+  isBypass = false,
   email,
   theme,
   ...params
@@ -103,7 +123,7 @@ export const Conversation:FC<ConversationProps> = ({
 
   const audioStreamDestination = useRef<MediaStreamAudioDestinationNode>(audioContext.current!.createMediaStreamDestination());
   const stereoMerger = useRef<ChannelMergerNode>(audioContext.current!.createChannelMerger(2));
-  const audioRecorder = useRef<MediaRecorder>(new MediaRecorder(audioStreamDestination.current.stream, { mimeType: getMimeType("audio"), audioBitsPerSecond: 128000  }));
+  const audioRecorder = useRef<MediaRecorder>(new MediaRecorder(audioStreamDestination.current.stream, { mimeType: getMimeType("audio"), audioBitsPerSecond: 128000 }));
   const [audioURL, setAudioURL] = useState<string>("");
   const [isOver, setIsOver] = useState(false);
   const modelParams = useModelParams(params);
@@ -140,10 +160,10 @@ export const Conversation:FC<ConversationProps> = ({
     audioRecorder.current.onstop = async () => {
       let blob: Blob;
       const mimeType = getMimeType("audio");
-      if(mimeType.includes("webm")) {
+      if (mimeType.includes("webm")) {
         blob = await fixWebmDuration(new Blob(audioChunks.current, { type: mimeType }));
-        } else {
-          blob = new Blob(audioChunks.current, { type: mimeType });
+      } else {
+        blob = new Blob(audioChunks.current, { type: mimeType });
       }
       setAudioURL(URL.createObjectURL(blob));
       audioChunks.current = [];
@@ -160,7 +180,7 @@ export const Conversation:FC<ConversationProps> = ({
   }, [start, workerAuthId]);
 
   const startRecording = useCallback(() => {
-    if(isRecording.current) {
+    if (isRecording.current) {
       return;
     }
     console.log(Date.now() % 1000, "Starting recording");
@@ -168,10 +188,10 @@ export const Conversation:FC<ConversationProps> = ({
     // Build stereo routing for recording: left = server (worklet), right = user mic (connected in useUserAudio)
     try {
       stereoMerger.current.disconnect();
-    } catch {}
+    } catch { }
     try {
       worklet.current?.disconnect(audioStreamDestination.current);
-    } catch {}
+    } catch { }
     // Route server audio (mono) to left channel of merger
     worklet.current?.connect(stereoMerger.current, 0, 0);
     // Connect merger to the MediaStream destination
@@ -185,31 +205,31 @@ export const Conversation:FC<ConversationProps> = ({
   const stopRecording = useCallback(() => {
     console.log("Stopping recording");
     console.log("isRecording", isRecording)
-    if(!isRecording.current) {
+    if (!isRecording.current) {
       return;
     }
     try {
       worklet.current?.disconnect(stereoMerger.current);
-    } catch {}
+    } catch { }
     try {
       stereoMerger.current.disconnect(audioStreamDestination.current);
-    } catch {}
+    } catch { }
     audioRecorder.current.stop();
     isRecording.current = false;
   }, [isRecording, worklet, audioStreamDestination, audioRecorder, stereoMerger]);
 
   const onPressConnect = useCallback(async () => {
-      if (isOver) {
-        window.location.reload();
+    if (isOver) {
+      window.location.reload();
+    } else {
+      audioContext.current?.resume();
+      if (socketStatus !== "connected") {
+        start();
       } else {
-        audioContext.current?.resume();
-        if (socketStatus !== "connected") {
-          start();
-        } else {
-          stop();
-        }
+        stop();
       }
-    }, [socketStatus, isOver, start, stop]);
+    }
+  }, [socketStatus, isOver, start, stop]);
 
   const socketColor = useMemo(() => {
     if (socketStatus === "connected") {
@@ -240,56 +260,56 @@ export const Conversation:FC<ConversationProps> = ({
         socket,
       }}
     >
-    <div>
-    <div className="main-grid h-screen max-h-screen w-screen p-4 max-w-96 md:max-w-screen-lg m-auto">
-      <div className="controls text-center flex justify-center items-center gap-2">
-         <Button
-            onClick={onPressConnect}
-            disabled={socketStatus !== "connected" && !isOver}
-          >
-            {socketButtonMsg}
-          </Button>
-          <div className={`h-4 w-4 rounded-full ${socketColor}`} />
-        </div>
-        {audioContext.current && worklet.current && <MediaContext.Provider value={
-          {
-            startRecording,
-            stopRecording,
-            audioContext: audioContext as MutableRefObject<AudioContext>,
-            worklet: worklet as MutableRefObject<AudioWorkletNode>,
-            audioStreamDestination,
-            stereoMerger,
-            micDuration,
-            actualAudioPlayed,
-          }
-        }>
-          <div className="relative player h-full max-h-full w-full justify-between gap-3 md:p-12">
+      <div>
+        <div className="main-grid h-screen max-h-screen w-screen p-4 max-w-96 md:max-w-screen-lg m-auto">
+          <div className="controls text-center flex justify-center items-center gap-2">
+            <Button
+              onClick={onPressConnect}
+              disabled={socketStatus !== "connected" && !isOver}
+            >
+              {socketButtonMsg}
+            </Button>
+            <div className={`h-4 w-4 rounded-full ${socketColor}`} />
+          </div>
+          {audioContext.current && worklet.current && <MediaContext.Provider value={
+            {
+              startRecording,
+              stopRecording,
+              audioContext: audioContext as MutableRefObject<AudioContext>,
+              worklet: worklet as MutableRefObject<AudioWorkletNode>,
+              audioStreamDestination,
+              stereoMerger,
+              micDuration,
+              actualAudioPlayed,
+            }
+          }>
+            <div className="relative player h-full max-h-full w-full justify-between gap-3 md:p-12">
               <ServerAudio
                 setGetAudioStats={(callback: () => AudioStats) =>
                   (getAudioStats.current = callback)
                 }
                 theme={theme}
               />
-              <UserAudio theme={theme}/>
+              <UserAudio theme={theme} />
               <div className="pt-8 text-sm flex justify-center items-center flex-col download-links">
                 {audioURL && <div><a href={audioURL} download={`personaplex_audio.${getExtension("audio")}`} className="pt-2 text-center block">Download audio</a></div>}
               </div>
-          </div>
-          <div className="scrollbar player-text" ref={textContainerRef}>
-            <TextDisplay containerRef={textContainerRef}/>
-          </div>
-          <div className="player-stats hidden md:block">
-            <ServerAudioStats getAudioStats={getAudioStats} />
-          </div></MediaContext.Provider>}
+            </div>
+            <div className="scrollbar player-text" ref={textContainerRef}>
+              <TextDisplay containerRef={textContainerRef} />
+            </div>
+            <div className="player-stats hidden md:block">
+              <ServerAudioStats getAudioStats={getAudioStats} />
+            </div></MediaContext.Provider>}
         </div>
         <div className="max-w-96 md:max-w-screen-lg p-4 m-auto text-center">
-          <ServerInfo/>
+          <ServerInfo />
         </div>
       </div>
     </SocketContext.Provider>
   );
 };
 
-        // </MediaContext.Provider> : undefined}
-        // 
-        // }></MediaContext.Provider>
+// </MediaContext.Provider> : undefined}
+//
+// }></MediaContext.Provider>
