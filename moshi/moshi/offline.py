@@ -90,7 +90,7 @@ def wrap_with_system_tags(text: str) -> str:
     return f"<system> {cleaned} <system>"
 
 
-def warmup(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, device: str, frame_size: int):
+def warmup(mimi: MimiModel, lm_gen: LMGen, device: str, frame_size: int):
     """Run a short warmup loop to initialize CUDA graphs and streaming state.
 
     Replicates the same warmup behavior as server.py: zeros → encode → LMGen.step → decode.
@@ -98,26 +98,23 @@ def warmup(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, device: str, f
     for _ in range(4):
         chunk = torch.zeros(1, 1, frame_size, dtype=torch.float32, device=device)
         codes = mimi.encode(chunk)
-        _ = other_mimi.encode(chunk)
         for c in range(codes.shape[-1]):
             tokens = lm_gen.step(codes[:, :, c : c + 1])
             if tokens is None:
                 continue
             # Decode agent audio channels to ensure decode graphs/states are primed
             _ = mimi.decode(tokens[:, 1:9])
-            _ = other_mimi.decode(tokens[:, 1:9])
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
-def decode_tokens_to_pcm(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, tokens: torch.Tensor) -> np.ndarray:
+def decode_tokens_to_pcm(mimi: MimiModel, tokens: torch.Tensor) -> np.ndarray:
     """Decode a single step of model tokens to PCM using Mimi.
 
     tokens is shaped [B, dep_q+1, 1]; channels 1..dep_q are the agent audio codebooks.
     Returns a 1D float32 numpy array (mono) for the current frame.
     """
     pcm = mimi.decode(tokens[:, 1:9])
-    _ = other_mimi.decode(tokens[:, 1:9])
     pcm = pcm.detach().cpu().numpy()[0, 0]
     return pcm
 
@@ -191,7 +188,6 @@ def run_inference(
     if mimi_weight is None:
         mimi_weight = hf_hub_download(hf_repo, loaders.MIMI_NAME)  # type: ignore
     mimi = loaders.get_mimi(mimi_weight, device)
-    other_mimi = loaders.get_mimi(mimi_weight, device)
     log("info", "mimi loaded")
 
     # 2) Load tokenizer
@@ -224,12 +220,11 @@ def run_inference(
     )
     # Keep models in streaming mode similar to the server
     mimi.streaming_forever(1)
-    other_mimi.streaming_forever(1)
     lm_gen.streaming_forever(1)
 
     # 5) Warmup
     log("info", "warming up the model")
-    warmup(mimi, other_mimi, lm_gen, device, frame_size)
+    warmup(mimi, lm_gen, device, frame_size)
 
     # 6) Prompt configuration (text + voice)
     # System text tokens (k=0) and agent voice-prompt audio (k=1..dep_q) are forced
@@ -248,7 +243,6 @@ def run_inference(
     #    - Text prompt injection
     #    - Final audio silence
     mimi.reset_streaming()
-    other_mimi.reset_streaming()
     lm_gen.reset_streaming()
     lm_gen.step_system_prompts(mimi)
     # Reset mimi streaming after voice prompt encoding
@@ -280,7 +274,7 @@ def run_inference(
             if tokens is None:
                 continue
             # Decode current sampled agent frame to PCM
-            pcm = decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens)
+            pcm = decode_tokens_to_pcm(mimi, tokens)
             generated_frames.append(pcm)
             # Decode text token
             text_token = tokens[0, 0, 0].item()
