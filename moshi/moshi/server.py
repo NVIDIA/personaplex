@@ -89,16 +89,14 @@ def wrap_with_system_tags(text: str) -> str:
 @dataclass
 class ServerState:
     mimi: MimiModel
-    other_mimi: MimiModel
     text_tokenizer: sentencepiece.SentencePieceProcessor
     lm_gen: LMGen
     lock: asyncio.Lock
 
-    def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
+    def __init__(self, mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
                  save_voice_prompt_embeddings: bool = False):
         self.mimi = mimi
-        self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
@@ -113,20 +111,17 @@ class ServerState:
         
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
-        self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
     
     def warmup(self):
         for _ in range(4):
             chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
             codes = self.mimi.encode(chunk)
-            _ = self.other_mimi.encode(chunk)
             for c in range(codes.shape[-1]):
                 tokens = self.lm_gen.step(codes[:, :, c: c + 1])
                 if tokens is None:
                     continue
                 _ = self.mimi.decode(tokens[:, 1:9])
-                _ = self.other_mimi.decode(tokens[:, 1:9])
 
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
@@ -222,14 +217,12 @@ class ServerState:
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk)
-                    _ = self.other_mimi.encode(chunk)
                     for c in range(codes.shape[-1]):
                         tokens = self.lm_gen.step(codes[:, :, c: c + 1])
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
-                        _ = self.other_mimi.decode(tokens[:, 1:9])
                         main_pcm = main_pcm.cpu()
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
                         text_token = tokens[0, 0, 0].item()
@@ -263,7 +256,6 @@ class ServerState:
             opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
             opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
             self.mimi.reset_streaming()
-            self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
             async def is_alive():
                 if close or ws.closed:
@@ -432,7 +424,6 @@ def main():
     if args.mimi_weight is None:
         args.mimi_weight = hf_hub_download(args.hf_repo, loaders.MIMI_NAME)
     mimi = loaders.get_mimi(args.mimi_weight, args.device)
-    other_mimi = loaders.get_mimi(args.mimi_weight, args.device)
     logger.info("mimi loaded")
 
     if args.tokenizer is None:
@@ -447,7 +438,6 @@ def main():
     logger.info("moshi loaded")
     state = ServerState(
         mimi=mimi,
-        other_mimi=other_mimi,
         text_tokenizer=text_tokenizer,
         lm=lm,
         device=args.device,
