@@ -95,6 +95,25 @@ python -m moshi.offline \
   --output-text "output.json"
 ```
 
+### Troubleshooting
+
+**Torch not compiled with CUDA enabled**
+
+If you encounter an error like `AssertionError: Torch not compiled with CUDA enabled`, it means your PyTorch installation does not support CUDA or you are running on a machine without NVIDIA GPUs (e.g., macOS). You must explicitly specify the CPU device:
+```bash
+python -m moshi.server --ssl "$SSL_DIR" --device cpu
+```
+
+**401 Unauthorized / Gated Repo Error**
+
+If you see a 401 Unauthorized error when downloading models, ensure you have:
+1. Created a Hugging Face account.
+2. Accepted the model license on the [PersonaPlex model page](https://huggingface.co/nvidia/personaplex-7b-v1).
+3. Logged in locally using the CLI:
+```bash
+huggingface-cli login
+```
+
 ## Voices
 
 PersonaPlex supports a wide range of voices; we pre-package embeddings for voices that sound more natural and conversational (NAT) and others that are more varied (VAR). The fixed set of voices are labeled:
