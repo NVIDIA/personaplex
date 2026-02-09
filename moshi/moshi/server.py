@@ -44,11 +44,16 @@ import sentencepiece
 import sphn
 import torch
 import random
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
+from .voice_discovery import VoiceDiscovery
 
 
 logger = setup_logger(__name__)
@@ -308,6 +313,20 @@ class ServerState:
         clog.log("info", "done with connection")
         return ws
 
+    async def handle_list_voices(self, request):
+        """List all available voices from configured directories."""
+        try:
+            voices = VoiceDiscovery.list_voices()
+            return web.json_response({
+                'voices': voices,
+                'count': len(voices)
+            })
+        except Exception as e:
+            logger.error(f"Error listing voices: {e}")
+            return web.json_response({
+                'error': str(e)
+            }, status=500)
+
 
 def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
     """
@@ -338,8 +357,51 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
     return str(voices_dir)
 
 
+def _is_valid_ui_build(dist_path: Path) -> bool:
+    """
+    Validate that a directory contains a valid UI build.
+
+    Args:
+        dist_path: Path to the dist directory
+
+    Returns:
+        True if the directory contains a valid build (has index.html), False otherwise
+    """
+    if not dist_path.is_dir():
+        return False
+
+    # Check for essential file - index.html must exist and be non-empty
+    index_html = dist_path / "index.html"
+    try:
+        return index_html.exists() and index_html.stat().st_size > 0
+    except (OSError, PermissionError):
+        return False
+
+
 def _get_static_path(static: Optional[str]) -> Optional[str]:
     if static is None:
+        # Auto-detect: prefer local custom UI (client/dist) if it exists
+        try:
+            # Priority 1: Check current working directory (works for all install modes)
+            cwd_dist = Path.cwd() / "client" / "dist"
+            if _is_valid_ui_build(cwd_dist):
+                logger.info(f"Found custom UI at {cwd_dist}, using it instead of default")
+                return str(cwd_dist)
+
+            # Priority 2: Check project root relative to __file__ (works for editable installs)
+            # server.py is in moshi/moshi/, so project root is 2 levels up
+            project_root = Path(__file__).parent.parent.parent
+            local_dist = project_root / "client" / "dist"
+
+            if _is_valid_ui_build(local_dist):
+                logger.info(f"Found custom UI at {local_dist}, using it instead of default")
+                return str(local_dist)
+
+        except (OSError, PermissionError) as e:
+            logger.warning(f"Could not check for custom UI: {e}. Falling back to default.")
+            # Fall through to HuggingFace download
+
+        # Fall back to HuggingFace default UI
         logger.info("retrieving the static content")
         dist_tgz = hf_hub_download("nvidia/personaplex-7b-v1", "dist.tgz")
         dist_tgz = Path(dist_tgz)
@@ -392,6 +454,16 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Warn if .env exists but HF_TOKEN is not set
+    env_file = Path(__file__).parent.parent.parent / ".env"
+    if env_file.exists() and not os.getenv("HF_TOKEN"):
+        logger.warning(
+            "Found .env file but HF_TOKEN is not set. "
+            "Models requiring authentication may fail to download. "
+            "See .env.example for configuration details."
+        )
+
     args.voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
         args.hf_repo,
@@ -457,7 +529,19 @@ def main():
     logger.info("warming up the model")
     state.warmup()
     app = web.Application()
+
+    # Register API routes FIRST before static catch-all
+    async def test_endpoint(request):
+        return web.json_response({"status": "ok", "test": True})
+
+    app.router.add_get("/api/test", test_endpoint)
     app.router.add_get("/api/chat", state.handle_chat)
+    app.router.add_get("/api/voices", state.handle_list_voices)
+
+    # Debug: log registered routes
+    logger.info(f"Registered routes so far: {[r.resource.canonical for r in app.router.routes()]}")
+
+    # Register static routes AFTER API routes
     if static_path is not None:
         async def handle_root(_):
             return web.FileResponse(os.path.join(static_path, "index.html"))
@@ -467,6 +551,9 @@ def main():
         app.router.add_static(
             "/", path=static_path, follow_symlinks=True, name="static"
         )
+
+    # Debug: log all routes after registration
+    logger.info(f"All registered routes: {[(r.method, r.resource.canonical) for r in app.router.routes()]}")
     protocol = "http"
     ssl_context = None
     if args.ssl is not None:
