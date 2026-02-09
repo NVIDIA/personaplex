@@ -1,7 +1,12 @@
 [project]
 name = "moshi-personaplex"
-requires-python = ">= 3.10"
+version = "0.1.0"
 description = "Personaplex finetune of moshi to enable role and voice control."
+readme = "README.md"
+authors = [{name = "Rajarshi Roy", email = "rajarshir@nvidia.com"}]
+maintainers = [{name = "Rajarshi Roy", email = "rajarshir@nvidia.com"}]
+license = {text = "MIT"}
+requires-python = ">= 3.10"
 dependencies = [
     "numpy >= 1.26, < 2.2",
     "safetensors >= 0.4.0, < 0.5",
@@ -10,22 +15,36 @@ dependencies = [
     "sentencepiece == 0.2",
     "sounddevice == 0.5",
     "sphn >= 0.1.4, < 0.2",
-    "torch >= 2.2.0, < 2.5",
+    "torch >= 2.2.0",
     "aiohttp>=3.10.5, <3.11",
 ]
-authors = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
-maintainers = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
-license = {text = "MIT"}
-dynamic = ["version"]
-readme = "README.md"
+
+[build-system]
+requires = ["uv_build>=0.9.13,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "moshi"
+module-root = ""
 
 [project.scripts]
 moshi-server = "moshi.server:main"
 moshi-offline = "moshi.offline:main"
 
-[tool.setuptools.dynamic]
-version = {attr = "moshi.__version__"}
 
-[build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"
+# CUDA Config
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", extra = "cu130" },
+]
+
+[project.optional-dependencies]
+cu130 = [
+  "torch >= 2.2.0",
+]
