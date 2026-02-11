@@ -75,6 +75,13 @@ const buildURL = ({
   url.searchParams.append("repetition_penalty", params.repetitionPenalty.toString());
   url.searchParams.append("text_prompt", params.textPrompt.toString());
   url.searchParams.append("voice_prompt", params.voicePrompt.toString());
+
+  // Attach API key for backend authentication
+  const apiKey = import.meta.env.VITE_PERSONAPLEX_API_KEY;
+  if (apiKey) {
+    url.searchParams.append("api_key", apiKey);
+  }
+
   console.log(url.toString());
   return url.toString();
 };

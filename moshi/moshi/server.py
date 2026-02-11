@@ -27,6 +27,7 @@
 import argparse
 import asyncio
 from dataclasses import dataclass
+import json
 import random
 import os
 from pathlib import Path
@@ -53,6 +54,55 @@ from .utils.logging import setup_logger, ColorizedLog
 
 logger = setup_logger(__name__)
 DeviceString = Literal["cuda"] | Literal["cpu"] #| Literal["mps"]
+
+# ---------------------------------------------------------------------------
+# API Key Authentication Middleware
+# ---------------------------------------------------------------------------
+
+def _load_api_key(cli_value: Optional[str] = None) -> str:
+    """Resolve the API key from CLI arg, env var, or auto-generate one."""
+    key = cli_value or os.environ.get("PERSONAPLEX_API_KEY", "").strip()
+    if not key:
+        key = secrets.token_urlsafe(48)
+        logger.info(
+            "No API key provided. Auto-generated key (save this!):\n"
+            f"  PERSONAPLEX_API_KEY={key}"
+        )
+    return key
+
+
+def _make_api_key_middleware(api_key: str):
+    """Return an aiohttp middleware that validates API key on /api/* routes."""
+
+    @web.middleware
+    async def api_key_middleware(request: web.Request, handler):
+        path = request.path
+
+        # Skip auth for non-API routes (static files, root page)
+        if not path.startswith("/api/"):
+            return await handler(request)
+
+        # Accept key from header or query parameter
+        provided_key = (
+            request.headers.get("X-API-Key")
+            or request.query.get("api_key")
+        )
+
+        if not provided_key:
+            return web.json_response(
+                {"error": "Unauthorized", "message": "Missing API key. Provide via X-API-Key header or api_key query parameter."},
+                status=401,
+            )
+
+        if not secrets.compare_digest(provided_key, api_key):
+            return web.json_response(
+                {"error": "Forbidden", "message": "Invalid API key."},
+                status=403,
+            )
+
+        return await handler(request)
+
+    return api_key_middleware
 
 def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
     """Return a torch.device based on the requested string or availability."""
@@ -372,7 +422,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device on which to run, defaults to 'cuda'.")
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
-                             "Requires 'accelerate' package.")
+                              "Requires 'accelerate' package.")
     parser.add_argument(
         "--voice-prompt-dir",
         type=str,
@@ -390,8 +440,22 @@ def main():
             "that contains valid key.pem and cert.pem files"
         )
     )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help=(
+            "API key for authenticating requests. "
+            "Can also be set via PERSONAPLEX_API_KEY env var. "
+            "If neither is provided, a key is auto-generated and printed."
+        )
+    )
 
     args = parser.parse_args()
+
+    # --- API key setup ---
+    api_key = _load_api_key(args.api_key)
+    logger.info(f"API key loaded (last 8 chars): ...{api_key[-8:]}")
     args.voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
         args.hf_repo,
@@ -456,7 +520,26 @@ def main():
     )
     logger.info("warming up the model")
     state.warmup()
-    app = web.Application()
+    # --- Build application with API key middleware ---
+    app = web.Application(middlewares=[_make_api_key_middleware(api_key)])
+
+    # --- Health endpoint ---
+    async def handle_health(request: web.Request):
+        return web.json_response({"status": "ok", "version": "0.1.0"})
+
+    # --- Voices endpoint ---
+    voice_prompt_dir_for_api = args.voice_prompt_dir
+
+    async def handle_voices(request: web.Request):
+        voices = []
+        if voice_prompt_dir_for_api and os.path.isdir(voice_prompt_dir_for_api):
+            for f in sorted(os.listdir(voice_prompt_dir_for_api)):
+                if f.endswith(('.pt', '.wav', '.mp3', '.flac')):
+                    voices.append({"filename": f, "name": os.path.splitext(f)[0]})
+        return web.json_response({"voices": voices, "count": len(voices)})
+
+    app.router.add_get("/api/health", handle_health)
+    app.router.add_get("/api/voices", handle_voices)
     app.router.add_get("/api/chat", state.handle_chat)
     if static_path is not None:
         async def handle_root(_):
