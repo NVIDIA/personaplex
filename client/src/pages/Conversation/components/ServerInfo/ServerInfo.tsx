@@ -5,18 +5,27 @@ export const ServerInfo = () => {
   if (!serverInfo) {
     return null;
   }
+
+  const items = [
+    { label: "Text Temp", value: serverInfo.text_temperature },
+    { label: "Text TopK", value: serverInfo.text_topk },
+    { label: "Audio Temp", value: serverInfo.audio_temperature },
+    { label: "Audio TopK", value: serverInfo.audio_topk },
+    { label: "Pad Mult", value: serverInfo.pad_mult },
+    { label: "Repeat Penalty N", value: serverInfo.repetition_penalty_context },
+    { label: "Repeat Penalty", value: serverInfo.repetition_penalty },
+    { label: "Model", value: serverInfo.lm_model_file },
+    { label: "Instance", value: serverInfo.instance_name },
+  ];
+
   return (
-    <div className="p-2 pt-4 self-center flex flex-col break-words">
-      Our server is running on the following configuration:
-        <div>Text temperature: {serverInfo.text_temperature}</div>
-        <div>Text topk: {serverInfo.text_topk}</div>
-        <div>Audio temperature: {serverInfo.audio_temperature}</div>
-        <div>Audio topk: {serverInfo.audio_topk}</div>
-        <div>Pad mult: {serverInfo.pad_mult}</div>
-        <div>Repeat penalty last N: {serverInfo.repetition_penalty_context}</div>
-        <div>Repeat penalty: {serverInfo.repetition_penalty}</div>
-        <div>LM model file: {serverInfo.lm_model_file}</div>
-        <div>Instance name: {serverInfo.instance_name}</div>
+    <div className="flex flex-wrap gap-x-6 gap-y-2">
+      {items.map((item) => (
+        <div key={item.label} className="flex items-center gap-1.5 text-xs">
+          <span className="text-white/30">{item.label}:</span>
+          <span className="text-white/50 font-mono">{item.value}</span>
+        </div>
+      ))}
     </div>
   );
 };

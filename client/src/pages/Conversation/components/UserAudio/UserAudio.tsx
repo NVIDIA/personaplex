@@ -7,7 +7,7 @@ import { type ThemeType } from "../../hooks/useSystemTheme";
 type UserAudioProps = {
   theme: ThemeType;
 };
-export const UserAudio: FC<UserAudioProps> = ({theme}) => {
+export const UserAudio: FC<UserAudioProps> = ({ theme }) => {
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
   const { sendMessage, socketStatus } = useSocketContext();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -65,8 +65,11 @@ export const UserAudio: FC<UserAudioProps> = ({theme}) => {
   }, [startRecordingUser, stopRecording, socketStatus]);
 
   return (
-    <div className="user-audio h-5/6 aspect-square" ref={containerRef}>
-      <ClientVisualizer theme={theme} analyser={analyser} parent={containerRef}/>
+    <div className="w-full flex flex-col items-center">
+      <p className="text-xs text-white/40 mb-3 font-medium">Your Voice</p>
+      <div className="w-32 h-32 md:w-40 md:h-40" ref={containerRef}>
+        <ClientVisualizer theme={theme} analyser={analyser} parent={containerRef} />
+      </div>
     </div>
   );
 };

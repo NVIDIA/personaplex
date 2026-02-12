@@ -49,29 +49,25 @@ export const ServerAudioStats = ({ getAudioStats }: ServerAudioStatsProps) => {
     };
   }, []);
 
+  const latency = movingAverageCount.current > 0
+    ? (movingAverageSum.current / movingAverageCount.current).toFixed(3)
+    : "0.000";
+
+  const stats = [
+    { label: "Audio Played", value: convertMinSecs(audioStats.playedAudioDuration) },
+    { label: "Missed Audio", value: convertMinSecs(audioStats.missedAudioDuration) },
+    { label: "Latency", value: `${latency}s` },
+    { label: "Buffer (Min/Max)", value: `${audioStats.minPlaybackDelay.toFixed(3)} / ${audioStats.maxPlaybackDelay.toFixed(3)}` },
+  ];
+
   return (
-    <div className="w-full rounded-lg text-zinc-500 p-2">
-      <h2 className="text-md pb-2">Server Audio Stats</h2>
-      <table>
-        <tbody>
-          <tr>
-            <td className="text-md pr-2">Audio played: </td>
-            <td>{convertMinSecs(audioStats.playedAudioDuration)}</td>
-          </tr>
-          <tr>
-            <td className="text-md pr-2">Missed audio: </td>
-            <td>{convertMinSecs(audioStats.missedAudioDuration)}</td>
-          </tr>
-          <tr>
-            <td className="text-md pr-2">Latency: </td>
-            <td>{(movingAverageSum.current / movingAverageCount.current).toFixed(3)}</td>
-          </tr>
-          <tr>
-            <td className="text-md pr-2">Min/Max buffer: </td>
-            <td>{audioStats.minPlaybackDelay.toFixed(3)} / {audioStats.maxPlaybackDelay.toFixed(3)}</td>
-          </tr>
-        </tbody>
-      </table>
+    <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+      {stats.map((stat) => (
+        <div key={stat.label} className="flex flex-col gap-1">
+          <span className="text-[10px] uppercase tracking-wider text-white/30 font-medium">{stat.label}</span>
+          <span className="text-sm font-mono text-white/70">{stat.value}</span>
+        </div>
+      ))}
     </div>
   );
 };
