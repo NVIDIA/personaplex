@@ -2,6 +2,7 @@ import { FC, useRef } from "react";
 import { AudioStats, useServerAudio } from "../../hooks/useServerAudio";
 import { ServerVisualizer } from "../AudioVisualizer/ServerVisualizer";
 import { type ThemeType } from "../../hooks/useSystemTheme";
+import { useI18n } from "../../../../i18n";
 
 type ServerAudioProps = {
   setGetAudioStats: (getAudioStats: () => AudioStats) => void;
@@ -12,18 +13,19 @@ export const ServerAudio: FC<ServerAudioProps> = ({ setGetAudioStats, theme }) =
     setGetAudioStats,
   });
   const containerRef = useRef<HTMLDivElement>(null);
+  const { t } = useI18n();
   return (
     <>
       {hasCriticalDelay && (
         <div className="fixed left-0 top-0 flex w-screen justify-between bg-red-500 p-2 text-center">
-          <p>A connection issue has been detected, you've been reconnected</p>
+          <p>{t("conversation.connectionIssue")}</p>
           <button
             onClick={async () => {
               setHasCriticalDelay(false);
             }}
             className="bg-white p-1 text-black"
           >
-            Dismiss
+            {t("conversation.dismiss")}
           </button>
         </div>
       )}

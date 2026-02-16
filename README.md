@@ -159,6 +159,82 @@ Personaplex finetunes Moshi and benefits from the generalization capabilities of
 You enjoy having a good conversation. Have a technical discussion about fixing a reactor core on a spaceship to Mars. You are an astronaut on a Mars mission. Your name is Alex. You are already dealing with a reactor core meltdown on a Mars mission. Several ship systems are failing, and continued instability will lead to catastrophic failure. You explain what is happening and you urgently ask for help thinking through how to stabilize the reactor.
 ```
 
+## Korean Language Support
+
+PersonaPlex supports Korean conversations through a parallel pipeline using best-in-class open-source components:
+
+- **ASR**: `faster-whisper` (Korean speech to text)
+- **LLM**: Any OpenAI-compatible API (Korean text generation)
+- **TTS**: CosyVoice2-0.5B (Korean text to speech, streaming)
+
+### Additional Dependencies
+
+Install Korean language support dependencies:
+```bash
+pip install faster-whisper>=1.0.0 openai>=1.0.0 librosa>=0.10.0
+```
+
+For CosyVoice2 TTS, follow the [CosyVoice2 installation guide](https://github.com/FunAudioLLM/CosyVoice).
+
+### LLM Backend Setup
+
+Korean mode requires an OpenAI-compatible LLM backend. The easiest option is [Ollama](https://ollama.ai):
+
+```bash
+# Install and start Ollama, then pull a Korean-capable model
+ollama pull qwen2.5:7b
+```
+
+### Launching with Korean Support
+
+```bash
+# English + Korean (both pipelines)
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --language all \
+  --llm-endpoint http://localhost:11434/v1 --llm-model qwen2.5:7b
+
+# Korean only
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --language ko \
+  --llm-endpoint http://localhost:11434/v1 --llm-model qwen2.5:7b
+```
+
+### Korean CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--language` | `en` | Language mode: `en`, `ko`, or `all` |
+| `--llm-endpoint` | `http://localhost:11434/v1` | OpenAI-compatible LLM API endpoint |
+| `--llm-model` | `qwen2.5:7b` | LLM model name |
+| `--llm-api-key` | `ollama` | API key for the LLM endpoint |
+| `--whisper-model` | `large-v3` | Whisper model size for Korean ASR |
+| `--cosyvoice-model` | `FunAudioLLM/CosyVoice2-0.5B` | CosyVoice2 model for Korean TTS |
+
+### Korean Voices
+
+| Voice | Description | Gender |
+|-------|------------|--------|
+| 한국어 여성 1 | Korean Female Natural | F |
+| 한국어 여성 2 | Korean Female Expressive | F |
+| 한국어 남성 1 | Korean Male Natural | M |
+| 한국어 남성 2 | Korean Male Expressive | M |
+
+### Korean Pipeline Architecture
+
+```
+User Mic → Opus → WebSocket → faster-whisper (Korean ASR)
+                                    ↓
+                              Korean text
+                                    ↓
+                         LLM (OpenAI-compatible API)
+                                    ↓
+                           Korean response text
+                                    ↓
+                    CosyVoice2-0.5B (Korean TTS, streaming)
+                                    ↓
+                         PCM → Opus → WebSocket → Client Speaker
+```
+
+The Korean pipeline runs on a separate WebSocket endpoint (`/api/chat-ko`) and uses the same binary protocol as the English pipeline. Users select their language from the UI before connecting.
+
 ## License
 
 The present code is provided under the MIT license. The weights for the models are released under the NVIDIA Open Model license.
