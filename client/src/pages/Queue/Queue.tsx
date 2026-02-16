@@ -7,12 +7,20 @@ import { Button } from "../../components/Button/Button";
 import { useModelParams } from "../Conversation/hooks/useModelParams";
 import { env } from "../../env";
 import { prewarmDecoderWorker } from "../../decoder/decoderWorker";
+import { useI18n, Language } from "../../i18n";
 
 const VOICE_OPTIONS = [
   "NATF0.pt", "NATF1.pt", "NATF2.pt", "NATF3.pt",
   "NATM0.pt", "NATM1.pt", "NATM2.pt", "NATM3.pt",
   "VARF0.pt", "VARF1.pt", "VARF2.pt", "VARF3.pt", "VARF4.pt",
   "VARM0.pt", "VARM1.pt", "VARM2.pt", "VARM3.pt", "VARM4.pt",
+];
+
+const KOREAN_VOICE_OPTIONS = [
+  { key: "ko_female_1", label: "한국어 여성 1 (Natural)" },
+  { key: "ko_female_2", label: "한국어 여성 2 (Expressive)" },
+  { key: "ko_male_1", label: "한국어 남성 1 (Natural)" },
+  { key: "ko_male_2", label: "한국어 남성 2 (Expressive)" },
 ];
 
 const TEXT_PROMPT_PRESETS = [
@@ -34,6 +42,25 @@ const TEXT_PROMPT_PRESETS = [
   },
 ];
 
+const KOREAN_TEXT_PROMPT_PRESETS = [
+  {
+    label: "AI 비서 (기본)",
+    text: "당신은 친절한 AI 비서입니다. 사용자의 질문에 한국어로 자연스럽게 대답하세요.",
+  },
+  {
+    label: "은행 상담 (서비스)",
+    text: "당신은 은행 고객 서비스 상담원입니다. 정중하게 고객을 도와주세요.",
+  },
+  {
+    label: "의료 상담 (서비스)",
+    text: "당신은 의료 상담 안내원입니다. 환자의 질문에 친절하게 답변하세요.",
+  },
+  {
+    label: "우주비행사 (재미)",
+    text: "당신은 화성 임무 중인 우주비행사입니다. 우주선의 원자로 문제를 해결하기 위해 도움을 요청하고 있습니다. 긴급한 상황을 설명하고 함께 해결책을 찾아보세요.",
+  },
+];
+
 interface HomepageProps {
   showMicrophoneAccessMessage: boolean;
   startConnection: () => Promise<void>;
@@ -51,24 +78,66 @@ const Homepage = ({
   voicePrompt,
   setVoicePrompt,
 }: HomepageProps) => {
+  const { language, setLanguage, t } = useI18n();
+
+  const presets = language === "ko" ? KOREAN_TEXT_PROMPT_PRESETS : TEXT_PROMPT_PRESETS;
+  const isKorean = language === "ko";
+
   return (
     <div className="text-center h-screen w-screen p-4 flex flex-col items-center pt-8">
       <div className="mb-6">
-        <h1 className="text-4xl text-black">PersonaPlex</h1>
+        <h1 className="text-4xl text-black">{t("app.title")}</h1>
         <p className="text-sm text-gray-600 mt-2">
-          Full duplex conversational AI with text and voice control.
+          {t("app.description")}
         </p>
       </div>
 
       <div className="flex flex-grow justify-center items-center flex-col gap-6 w-full min-w-[500px] max-w-2xl">
+        {/* Language selector */}
+        <div className="w-full">
+          <label className="block text-left text-base font-medium text-gray-700 mb-2">
+            {t("queue.languageLabel")}
+          </label>
+          <div className="flex gap-2">
+            <button
+              onClick={() => {
+                setLanguage("en");
+                setTextPrompt(TEXT_PROMPT_PRESETS[0].text);
+                setVoicePrompt(VOICE_OPTIONS[0]);
+              }}
+              className={`flex-1 px-4 py-2 rounded border transition-colors ${
+                language === "en"
+                  ? "bg-[#76b900] text-white border-[#76b900]"
+                  : "bg-white text-gray-700 border-gray-300 hover:bg-gray-50"
+              }`}
+            >
+              EN (English)
+            </button>
+            <button
+              onClick={() => {
+                setLanguage("ko");
+                setTextPrompt(KOREAN_TEXT_PROMPT_PRESETS[0].text);
+                setVoicePrompt(KOREAN_VOICE_OPTIONS[0].key);
+              }}
+              className={`flex-1 px-4 py-2 rounded border transition-colors ${
+                language === "ko"
+                  ? "bg-[#76b900] text-white border-[#76b900]"
+                  : "bg-white text-gray-700 border-gray-300 hover:bg-gray-50"
+              }`}
+            >
+              한국어 (Korean)
+            </button>
+          </div>
+        </div>
+
         <div className="w-full">
           <label htmlFor="text-prompt" className="block text-left text-base font-medium text-gray-700 mb-2">
-            Text Prompt:
+            {t("queue.textPromptLabel")}
           </label>
           <div className="border border-gray-300 rounded p-3 mb-3 bg-gray-50">
-            <span className="text-xs font-medium text-gray-500 block mb-2">Examples:</span>
+            <span className="text-xs font-medium text-gray-500 block mb-2">{t("queue.examplesLabel")}</span>
             <div className="flex flex-wrap gap-2 justify-center">
-              {TEXT_PROMPT_PRESETS.map((preset) => (
+              {presets.map((preset) => (
                 <button
                   key={preset.label}
                   onClick={() => setTextPrompt(preset.text)}
@@ -85,7 +154,7 @@ const Homepage = ({
             value={textPrompt}
             onChange={(e) => setTextPrompt(e.target.value)}
             className="w-full h-32 min-h-[80px] max-h-64 p-3 bg-white text-black border border-gray-300 rounded resize-y focus:outline-none focus:ring-2 focus:ring-[#76b900] focus:border-transparent"
-            placeholder="Enter your text prompt..."
+            placeholder={t("queue.textPromptPlaceholder")}
             maxLength={1000}
           />
           <div className="text-right text-xs text-gray-500 mt-1">
@@ -95,7 +164,7 @@ const Homepage = ({
 
         <div className="w-full">
           <label htmlFor="voice-prompt" className="block text-left text-base font-medium text-gray-700 mb-2">
-            Voice:
+            {t("queue.voiceLabel")}
           </label>
           <select
             id="voice-prompt"
@@ -104,22 +173,28 @@ const Homepage = ({
             onChange={(e) => setVoicePrompt(e.target.value)}
             className="w-full p-3 bg-white text-black border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-[#76b900] focus:border-transparent"
           >
-            {VOICE_OPTIONS.map((voice) => (
-              <option key={voice} value={voice}>
-                {voice
-                  .replace('.pt', '')
-                  .replace(/^NAT/, 'NATURAL_')
-                  .replace(/^VAR/, 'VARIETY_')}
-              </option>
-            ))}
+            {isKorean
+              ? KOREAN_VOICE_OPTIONS.map((voice) => (
+                  <option key={voice.key} value={voice.key}>
+                    {voice.label}
+                  </option>
+                ))
+              : VOICE_OPTIONS.map((voice) => (
+                  <option key={voice} value={voice}>
+                    {voice
+                      .replace('.pt', '')
+                      .replace(/^NAT/, 'NATURAL_')
+                      .replace(/^VAR/, 'VARIETY_')}
+                  </option>
+                ))}
           </select>
       </div>
 
         {showMicrophoneAccessMessage && (
-          <p className="text-center text-red-500">Please enable your microphone before proceeding</p>
+          <p className="text-center text-red-500">{t("queue.microphoneError")}</p>
         )}
-        
-        <Button onClick={async () => await startConnection()}>Connect</Button>
+
+        <Button onClick={async () => await startConnection()}>{t("queue.connectButton")}</Button>
     </div>
     </div>
   );
@@ -127,6 +202,7 @@ const Homepage = ({
 
 export const Queue:FC = () => {
   const theme = "light" as const;  // Always use light theme
+  const { language } = useI18n();
   const [searchParams] = useSearchParams();
   const overrideWorkerAddr = searchParams.get("worker_addr");
   const [hasMicrophoneAccess, setHasMicrophoneAccess] = useState<boolean>(false);
@@ -135,7 +211,7 @@ export const Queue:FC = () => {
 
   const audioContext = useRef<AudioContext | null>(null);
   const worklet = useRef<AudioWorkletNode | null>(null);
-  
+
   // enable eruda in development
   useEffect(() => {
     if(env.VITE_ENV === "development") {
@@ -199,6 +275,7 @@ export const Queue:FC = () => {
         worklet={worklet as MutableRefObject<AudioWorkletNode|null>}
         theme={theme}
         startConnection={startConnection}
+        language={language}
         {...modelParams}
         />
       ) : (

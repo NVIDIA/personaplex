@@ -1,0 +1,48 @@
+{
+  "app": {
+    "title": "PersonaPlex",
+    "description": "Full duplex conversational AI with text and voice control."
+  },
+  "queue": {
+    "textPromptLabel": "Text Prompt:",
+    "examplesLabel": "Examples:",
+    "textPromptPlaceholder": "Enter your text prompt...",
+    "voiceLabel": "Voice:",
+    "connectButton": "Connect",
+    "microphoneError": "Please enable your microphone before proceeding",
+    "languageLabel": "Language:"
+  },
+  "conversation": {
+    "newConversation": "New Conversation",
+    "disconnect": "Disconnect",
+    "connecting": "Connecting...",
+    "downloadAudio": "Download audio",
+    "connectionIssue": "A connection issue has been detected, you've been reconnected",
+    "dismiss": "Dismiss"
+  },
+  "serverInfo": {
+    "header": "Our server is running on the following configuration:",
+    "textTemperature": "Text temperature",
+    "textTopk": "Text topk",
+    "audioTemperature": "Audio temperature",
+    "audioTopk": "Audio topk",
+    "padMult": "Pad mult",
+    "repeatPenaltyLastN": "Repeat penalty last N",
+    "repeatPenalty": "Repeat penalty",
+    "lmModelFile": "LM model file",
+    "instanceName": "Instance name"
+  },
+  "stats": {
+    "title": "Server Audio Stats",
+    "audioPlayed": "Audio played:",
+    "missedAudio": "Missed audio:",
+    "latency": "Latency:",
+    "minMaxBuffer": "Min/Max buffer:"
+  },
+  "presets": {
+    "assistant": "Assistant (default)",
+    "medical": "Medical office (service)",
+    "bank": "Bank (service)",
+    "astronaut": "Astronaut (fun)"
+  }
+}
