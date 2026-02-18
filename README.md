@@ -23,7 +23,7 @@ Install the [Opus audio codec](https://github.com/xiph/opus) development library
 sudo apt install libopus-dev
 
 # Fedora/RHEL
-sudo dnf install opus-devel
+sudo dnf install opus-devel python-devel
 
 # macOS
 brew install opus
@@ -33,7 +33,7 @@ brew install opus
 
 Download this repository and install with:
 ```bash
-pip install moshi/.
+pip install moshi
 ```
 
 Extra step for Blackwell based GPUs as suggested in (See https://github.com/NVIDIA/personaplex/issues/2):
