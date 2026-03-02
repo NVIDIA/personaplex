@@ -1,0 +1,294 @@
+{
+  "info": {
+    "name": "PersonaPlex API",
+    "description": "Full API collection for PersonaPlex — real-time full-duplex speech conversation with persona control.\n\nSee API_DOCUMENTATION.md for details.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "personaplex-api-collection"
+  },
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      {
+        "key": "key",
+        "value": "X-API-Key",
+        "type": "string"
+      },
+      {
+        "key": "value",
+        "value": "{{api_key}}",
+        "type": "string"
+      },
+      {
+        "key": "in",
+        "value": "header",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [],
+  "item": [
+    {
+      "name": "Health",
+      "description": "Server health check endpoints",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/health",
+              "host": ["{{base_url}}"],
+              "path": ["api", "health"]
+            },
+            "description": "Returns server status and version. Use this to verify the server is running and your API key is valid."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "header": [
+                { "key": "Content-Type", "value": "application/json" }
+              ],
+              "body": "{\n  \"status\": \"ok\",\n  \"version\": \"0.1.0\"\n}"
+            },
+            {
+              "name": "401 Unauthorized",
+              "status": "Unauthorized",
+              "code": 401,
+              "header": [
+                { "key": "Content-Type", "value": "application/json" }
+              ],
+              "body": "{\n  \"error\": \"Unauthorized\",\n  \"message\": \"Missing API key. Provide via X-API-Key header or api_key query parameter.\"\n}"
+            },
+            {
+              "name": "403 Forbidden",
+              "status": "Forbidden",
+              "code": 403,
+              "header": [
+                { "key": "Content-Type", "value": "application/json" }
+              ],
+              "body": "{\n  \"error\": \"Forbidden\",\n  \"message\": \"Invalid API key.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Health Check (No Auth - Expect 401)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/health",
+              "host": ["{{base_url}}"],
+              "path": ["api", "health"]
+            },
+            "description": "Test that health endpoint rejects requests without an API key."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Should return 401 Unauthorized', function () {",
+                  "    pm.response.to.have.status(401);",
+                  "});",
+                  "",
+                  "pm.test('Body contains error message', function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.error).to.eql('Unauthorized');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
+        {
+          "name": "Health Check (Bad Key - Expect 403)",
+          "request": {
+            "auth": {
+              "type": "apikey",
+              "apikey": [
+                { "key": "key", "value": "X-API-Key", "type": "string" },
+                { "key": "value", "value": "wrong-key-12345", "type": "string" },
+                { "key": "in", "value": "header", "type": "string" }
+              ]
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/health",
+              "host": ["{{base_url}}"],
+              "path": ["api", "health"]
+            },
+            "description": "Test that health endpoint rejects requests with an invalid API key."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Should return 403 Forbidden', function () {",
+                  "    pm.response.to.have.status(403);",
+                  "});",
+                  "",
+                  "pm.test('Body contains error message', function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData.error).to.eql('Forbidden');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Voices",
+      "description": "Voice prompt management endpoints",
+      "item": [
+        {
+          "name": "List Voices",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voices",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voices"]
+            },
+            "description": "Returns a list of all available voice prompt files on the server."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('Response has voices array', function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    pm.expect(jsonData).to.have.property('voices');",
+                  "    pm.expect(jsonData.voices).to.be.an('array');",
+                  "    pm.expect(jsonData).to.have.property('count');",
+                  "});",
+                  "",
+                  "pm.test('Voice objects have expected shape', function () {",
+                  "    var jsonData = pm.response.json();",
+                  "    if (jsonData.voices.length > 0) {",
+                  "        pm.expect(jsonData.voices[0]).to.have.property('filename');",
+                  "        pm.expect(jsonData.voices[0]).to.have.property('name');",
+                  "    }",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 OK",
+              "status": "OK",
+              "code": 200,
+              "header": [
+                { "key": "Content-Type", "value": "application/json" }
+              ],
+              "body": "{\n  \"voices\": [\n    { \"filename\": \"NATF0.pt\", \"name\": \"NATF0\" },\n    { \"filename\": \"NATF1.pt\", \"name\": \"NATF1\" },\n    { \"filename\": \"NATF2.pt\", \"name\": \"NATF2\" },\n    { \"filename\": \"NATM0.pt\", \"name\": \"NATM0\" },\n    { \"filename\": \"NATM1.pt\", \"name\": \"NATM1\" }\n  ],\n  \"count\": 5\n}"
+            }
+          ]
+        },
+        {
+          "name": "List Voices (via Query Param Auth)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/voices?api_key={{api_key}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "voices"],
+              "query": [
+                { "key": "api_key", "value": "{{api_key}}" }
+              ]
+            },
+            "description": "List voices using query parameter authentication (same as WebSocket auth method)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Chat (WebSocket)",
+      "description": "Real-time speech conversation WebSocket endpoint.\n\n⚠️ Postman's WebSocket support is limited. Use the WebSocket request type in Postman or test with wscat/browser.\n\nSample wscat command:\nwscat -n -c \"wss://localhost:8998/api/chat?api_key=YOUR_KEY&voice_prompt=NATF2.pt&text_prompt=Hello\"",
+      "item": [
+        {
+          "name": "Chat WebSocket (Reference)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/chat?api_key={{api_key}}&voice_prompt=NATF2.pt&text_prompt=You%20enjoy%20having%20a%20good%20conversation.&text_temperature=0.8&text_topk=250&audio_temperature=0.8&audio_topk=250&pad_mult=1.0&repetition_penalty=1.0&repetition_penalty_context=50",
+              "host": ["{{base_url}}"],
+              "path": ["api", "chat"],
+              "query": [
+                { "key": "api_key", "value": "{{api_key}}" },
+                { "key": "voice_prompt", "value": "NATF2.pt" },
+                { "key": "text_prompt", "value": "You enjoy having a good conversation." },
+                { "key": "text_temperature", "value": "0.8" },
+                { "key": "text_topk", "value": "250" },
+                { "key": "audio_temperature", "value": "0.8" },
+                { "key": "audio_topk", "value": "250" },
+                { "key": "pad_mult", "value": "1.0" },
+                { "key": "repetition_penalty", "value": "1.0" },
+                { "key": "repetition_penalty_context", "value": "50" }
+              ]
+            },
+            "description": "Reference request showing all parameters for the Chat WebSocket endpoint.\n\nThis is a WebSocket upgrade endpoint — use Postman's WebSocket tab or wscat to test.\n\n**Binary Protocol:**\n- 0x00: Server handshake\n- 0x01: Audio (bidirectional, Opus-encoded)\n- 0x02: Text token (server → client, UTF-8)"
+          },
+          "response": [
+            {
+              "name": "101 Switching Protocols",
+              "status": "Switching Protocols",
+              "code": 101,
+              "header": [
+                { "key": "Upgrade", "value": "websocket" },
+                { "key": "Connection", "value": "Upgrade" }
+              ],
+              "body": ""
+            },
+            {
+              "name": "401 Unauthorized (Missing Key)",
+              "status": "Unauthorized",
+              "code": 401,
+              "header": [
+                { "key": "Content-Type", "value": "application/json" }
+              ],
+              "body": "{\n  \"error\": \"Unauthorized\",\n  \"message\": \"Missing API key. Provide via X-API-Key header or api_key query parameter.\"\n}"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

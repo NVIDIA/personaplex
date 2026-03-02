@@ -976,7 +976,7 @@ class LMGen(StreamingModule[_LMGenState]):
 
     def load_voice_prompt_embeddings(self, path: str):
         self.voice_prompt = path
-        state = torch.load(path)
+        state = torch.load(path, map_location="cpu")
 
         self.voice_prompt_audio = None
         self.voice_prompt_embeddings = state["embeddings"].to(self.lm_model.device)
