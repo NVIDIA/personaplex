@@ -13,6 +13,7 @@ import { ModelParamsValues, useModelParams } from "./hooks/useModelParams";
 import fixWebmDuration from "webm-duration-fix";
 import { getMimeType, getExtension } from "./getMimeType";
 import { type ThemeType } from "./hooks/useSystemTheme";
+import { useI18n, type Language } from "../../i18n";
 
 type ConversationProps = {
   workerAddr: string;
@@ -21,6 +22,7 @@ type ConversationProps = {
   sessionId?: number;
   email?: string;
   theme: ThemeType;
+  language?: Language;
   audioContext: MutableRefObject<AudioContext|null>;
   worklet: MutableRefObject<AudioWorkletNode|null>;
   onConversationEnd?: () => void;
@@ -36,6 +38,7 @@ const buildURL = ({
   email,
   textSeed,
   audioSeed,
+  language = "en",
 }: {
   workerAddr: string;
   params: ModelParamsValues;
@@ -43,6 +46,7 @@ const buildURL = ({
   email?: string;
   textSeed: number;
   audioSeed: number;
+  language?: Language;
 }) => {
   const newWorkerAddr = useMemo(() => {
     if (workerAddr == "same" || workerAddr == "") {
@@ -53,7 +57,8 @@ const buildURL = ({
     return workerAddr;
   }, [workerAddr]);
   const wsProtocol = (window.location.protocol === 'https:') ? 'wss' : 'ws';
-  const url = new URL(`${wsProtocol}://${newWorkerAddr}/api/chat`);
+  const chatEndpoint = language === "ko" ? "/api/chat-ko" : "/api/chat";
+  const url = new URL(`${wsProtocol}://${newWorkerAddr}${chatEndpoint}`);
   if(workerAuthId) {
     url.searchParams.append("worker_auth_id", workerAuthId);
   }
@@ -88,8 +93,10 @@ export const Conversation:FC<ConversationProps> = ({
   isBypass=false,
   email,
   theme,
+  language = "en",
   ...params
 }) => {
+  const { t } = useI18n();
   const getAudioStats = useRef<() => AudioStats>(() => ({
     playedAudioDuration: 0,
     missedAudioDuration: 0,
@@ -120,6 +127,7 @@ export const Conversation:FC<ConversationProps> = ({
     email: email,
     textSeed: textSeed,
     audioSeed: audioSeed,
+    language,
   });
 
   const onDisconnect = useCallback(() => {
@@ -223,14 +231,14 @@ export const Conversation:FC<ConversationProps> = ({
 
   const socketButtonMsg = useMemo(() => {
     if (isOver) {
-      return 'New Conversation';
+      return t("conversation.newConversation");
     }
     if (socketStatus === "connected") {
-      return 'Disconnect';
+      return t("conversation.disconnect");
     } else {
-      return 'Connecting...';
+      return t("conversation.connecting");
     }
-  }, [isOver, socketStatus]);
+  }, [isOver, socketStatus, t]);
 
   return (
     <SocketContext.Provider
@@ -272,7 +280,7 @@ export const Conversation:FC<ConversationProps> = ({
               />
               <UserAudio theme={theme}/>
               <div className="pt-8 text-sm flex justify-center items-center flex-col download-links">
-                {audioURL && <div><a href={audioURL} download={`personaplex_audio.${getExtension("audio")}`} className="pt-2 text-center block">Download audio</a></div>}
+                {audioURL && <div><a href={audioURL} download={`personaplex_audio.${getExtension("audio")}`} className="pt-2 text-center block">{t("conversation.downloadAudio")}</a></div>}
               </div>
           </div>
           <div className="scrollbar player-text" ref={textContainerRef}>

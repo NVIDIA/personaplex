@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { useI18n } from "../../../../i18n";
 
 type ServerAudioStatsProps = {
   getAudioStats: React.MutableRefObject<
@@ -15,6 +16,7 @@ type ServerAudioStatsProps = {
 
 export const ServerAudioStats = ({ getAudioStats }: ServerAudioStatsProps) => {
   const [audioStats, setAudioStats] = useState(getAudioStats.current());
+  const { t } = useI18n();
 
   const movingAverageSum = useRef<number>(0.);
   const movingAverageCount = useRef<number>(0.);
@@ -51,23 +53,23 @@ export const ServerAudioStats = ({ getAudioStats }: ServerAudioStatsProps) => {
 
   return (
     <div className="w-full rounded-lg text-zinc-500 p-2">
-      <h2 className="text-md pb-2">Server Audio Stats</h2>
+      <h2 className="text-md pb-2">{t("stats.title")}</h2>
       <table>
         <tbody>
           <tr>
-            <td className="text-md pr-2">Audio played: </td>
+            <td className="text-md pr-2">{t("stats.audioPlayed")} </td>
             <td>{convertMinSecs(audioStats.playedAudioDuration)}</td>
           </tr>
           <tr>
-            <td className="text-md pr-2">Missed audio: </td>
+            <td className="text-md pr-2">{t("stats.missedAudio")} </td>
             <td>{convertMinSecs(audioStats.missedAudioDuration)}</td>
           </tr>
           <tr>
-            <td className="text-md pr-2">Latency: </td>
+            <td className="text-md pr-2">{t("stats.latency")} </td>
             <td>{(movingAverageSum.current / movingAverageCount.current).toFixed(3)}</td>
           </tr>
           <tr>
-            <td className="text-md pr-2">Min/Max buffer: </td>
+            <td className="text-md pr-2">{t("stats.minMaxBuffer")} </td>
             <td>{audioStats.minPlaybackDelay.toFixed(3)} / {audioStats.maxPlaybackDelay.toFixed(3)}</td>
           </tr>
         </tbody>

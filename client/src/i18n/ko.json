@@ -1,0 +1,48 @@
+{
+  "app": {
+    "title": "PersonaPlex",
+    "description": "텍스트와 음성 제어가 가능한 전이중 대화형 AI."
+  },
+  "queue": {
+    "textPromptLabel": "텍스트 프롬프트:",
+    "examplesLabel": "예시:",
+    "textPromptPlaceholder": "텍스트 프롬프트를 입력하세요...",
+    "voiceLabel": "음성:",
+    "connectButton": "연결",
+    "microphoneError": "진행하기 전에 마이크를 활성화해 주세요",
+    "languageLabel": "언어:"
+  },
+  "conversation": {
+    "newConversation": "새 대화",
+    "disconnect": "연결 해제",
+    "connecting": "연결 중...",
+    "downloadAudio": "오디오 다운로드",
+    "connectionIssue": "연결 문제가 감지되어 다시 연결되었습니다",
+    "dismiss": "닫기"
+  },
+  "serverInfo": {
+    "header": "서버 구성 정보:",
+    "textTemperature": "텍스트 온도",
+    "textTopk": "텍스트 Top-K",
+    "audioTemperature": "오디오 온도",
+    "audioTopk": "오디오 Top-K",
+    "padMult": "패드 배수",
+    "repeatPenaltyLastN": "반복 패널티 마지막 N",
+    "repeatPenalty": "반복 패널티",
+    "lmModelFile": "LM 모델 파일",
+    "instanceName": "인스턴스 이름"
+  },
+  "stats": {
+    "title": "서버 오디오 통계",
+    "audioPlayed": "재생된 오디오:",
+    "missedAudio": "누락된 오디오:",
+    "latency": "지연 시간:",
+    "minMaxBuffer": "최소/최대 버퍼:"
+  },
+  "presets": {
+    "assistant": "AI 비서 (기본)",
+    "medical": "의료 상담 (서비스)",
+    "bank": "은행 상담 (서비스)",
+    "astronaut": "우주비행사 (재미)"
+  }
+}

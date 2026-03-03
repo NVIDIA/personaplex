@@ -391,6 +391,45 @@ def main():
         )
     )
 
+    # Korean language support arguments
+    parser.add_argument(
+        "--language",
+        type=str,
+        default="en",
+        choices=["en", "ko", "all"],
+        help="Language mode: 'en' (English only, default), 'ko' (Korean only), 'all' (both)."
+    )
+    parser.add_argument(
+        "--llm-endpoint",
+        type=str,
+        default="http://localhost:11434/v1",
+        help="OpenAI-compatible LLM API endpoint for Korean mode (e.g., Ollama, vLLM)."
+    )
+    parser.add_argument(
+        "--llm-model",
+        type=str,
+        default="qwen2.5:7b",
+        help="LLM model name for Korean mode."
+    )
+    parser.add_argument(
+        "--llm-api-key",
+        type=str,
+        default="ollama",
+        help="API key for the LLM endpoint."
+    )
+    parser.add_argument(
+        "--whisper-model",
+        type=str,
+        default="large-v3",
+        help="Whisper model size for Korean ASR."
+    )
+    parser.add_argument(
+        "--cosyvoice-model",
+        type=str,
+        default="FunAudioLLM/CosyVoice2-0.5B",
+        help="CosyVoice2 model for Korean TTS."
+    )
+
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
@@ -458,6 +497,32 @@ def main():
     state.warmup()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
+
+    # Korean language pipeline
+    if args.language in ("ko", "all"):
+        logger.info("initializing Korean language pipeline")
+        from .korean.asr import KoreanASR
+        from .korean.llm import KoreanLLM
+        from .korean.tts import KoreanTTS
+        from .korean.pipeline import KoreanPipeline
+
+        ko_device = "cuda" if args.device.type == "cuda" else "cpu"
+        ko_asr = KoreanASR(
+            model_size=args.whisper_model,
+            device=ko_device,
+        )
+        ko_llm = KoreanLLM(
+            endpoint=args.llm_endpoint,
+            model=args.llm_model,
+            api_key=args.llm_api_key,
+        )
+        ko_tts = KoreanTTS(
+            model_id=args.cosyvoice_model,
+            device=ko_device,
+        )
+        ko_pipeline = KoreanPipeline(asr=ko_asr, llm=ko_llm, tts=ko_tts)
+        app.router.add_get("/api/chat-ko", ko_pipeline.handle_chat)
+        logger.info("Korean pipeline ready at /api/chat-ko")
     if static_path is not None:
         async def handle_root(_):
             return web.FileResponse(os.path.join(static_path, "index.html"))
