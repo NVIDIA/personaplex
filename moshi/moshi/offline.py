@@ -51,6 +51,10 @@ import torch
 import sentencepiece
 import sphn
 from huggingface_hub import hf_hub_download
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from .client_utils import make_log
 from .models import loaders, LMGen, MimiModel
@@ -381,8 +385,20 @@ def main():
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
     parser.add_argument("--seed", type=int, default=-1, help="Seed for reproducibility (-1 disables)")
+    parser.add_argument(
+        "--save-voice-embeddings", action="store_true",
+        help="Save voice prompt embeddings to a .pt file for faster reuse"
+    )
 
     args = parser.parse_args()
+
+    # Warn if .env exists but HF_TOKEN is not set
+    env_file = Path(__file__).parent.parent.parent / ".env"
+    if env_file.exists() and not os.getenv("HF_TOKEN"):
+        log("warning",
+            "Found .env file but HF_TOKEN is not set. "
+            "Models requiring authentication may fail to download. "
+            "See .env.example for configuration details.")
 
     # If --voice-prompt-dir is omitted, voices.tgz is downloaded from HF and extracted.
     voice_prompt_dir = _get_voice_prompt_dir(
@@ -403,6 +419,7 @@ def main():
 
     # Normalize greedy flag behavior (True if present, False otherwise)
     greedy = bool(args.greedy)
+    save_embeddings = bool(args.save_voice_embeddings)
 
     with torch.no_grad():
         run_inference(
@@ -422,7 +439,7 @@ def main():
             topk_audio=args.topk_audio,
             topk_text=args.topk_text,
             greedy=greedy,
-            save_voice_prompt_embeddings=False,
+            save_voice_prompt_embeddings=save_embeddings,
             cpu_offload=args.cpu_offload,
         )
 

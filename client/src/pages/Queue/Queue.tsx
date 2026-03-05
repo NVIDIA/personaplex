@@ -7,13 +7,7 @@ import { Button } from "../../components/Button/Button";
 import { useModelParams } from "../Conversation/hooks/useModelParams";
 import { env } from "../../env";
 import { prewarmDecoderWorker } from "../../decoder/decoderWorker";
-
-const VOICE_OPTIONS = [
-  "NATF0.pt", "NATF1.pt", "NATF2.pt", "NATF3.pt",
-  "NATM0.pt", "NATM1.pt", "NATM2.pt", "NATM3.pt",
-  "VARF0.pt", "VARF1.pt", "VARF2.pt", "VARF3.pt", "VARF4.pt",
-  "VARM0.pt", "VARM1.pt", "VARM2.pt", "VARM3.pt", "VARM4.pt",
-];
+import { useVoices } from "../../hooks/useVoices";
 
 const TEXT_PROMPT_PRESETS = [
   {
@@ -41,6 +35,9 @@ interface HomepageProps {
   setTextPrompt: (value: string) => void;
   voicePrompt: string;
   setVoicePrompt: (value: string) => void;
+  voicesLoading: boolean;
+  voicesError: string | null;
+  voices: Array<{ name: string; type: string; category: string; path: string }>;
 }
 
 const Homepage = ({
@@ -50,6 +47,9 @@ const Homepage = ({
   setTextPrompt,
   voicePrompt,
   setVoicePrompt,
+  voicesLoading,
+  voicesError,
+  voices,
 }: HomepageProps) => {
   return (
     <div className="text-center h-screen w-screen p-4 flex flex-col items-center pt-8">
@@ -102,16 +102,24 @@ const Homepage = ({
             name="voice-prompt"
             value={voicePrompt}
             onChange={(e) => setVoicePrompt(e.target.value)}
-            className="w-full p-3 bg-white text-black border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-[#76b900] focus:border-transparent"
+            disabled={voicesLoading}
+            className="w-full p-3 bg-white text-black border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-[#76b900] focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed"
           >
-            {VOICE_OPTIONS.map((voice) => (
-              <option key={voice} value={voice}>
-                {voice
-                  .replace('.pt', '')
-                  .replace(/^NAT/, 'NATURAL_')
-                  .replace(/^VAR/, 'VARIETY_')}
-              </option>
-            ))}
+            {voicesLoading ? (
+              <option value="">Loading voices...</option>
+            ) : voicesError ? (
+              <option value="">Error loading voices</option>
+            ) : (
+              voices.map((voice) => (
+                <option key={voice.name} value={voice.name}>
+                  {voice.name
+                    .replace('.pt', '')
+                    .replace('.wav', '')
+                    .replace(/^NAT/, 'NATURAL_')
+                    .replace(/^VAR/, 'VARIETY_')}
+                </option>
+              ))
+            )}
           </select>
       </div>
 
@@ -132,6 +140,7 @@ export const Queue:FC = () => {
   const [hasMicrophoneAccess, setHasMicrophoneAccess] = useState<boolean>(false);
   const [showMicrophoneAccessMessage, setShowMicrophoneAccessMessage] = useState<boolean>(false);
   const modelParams = useModelParams();
+  const { voices, loading: voicesLoading, error: voicesError } = useVoices();
 
   const audioContext = useRef<AudioContext | null>(null);
   const worklet = useRef<AudioWorkletNode | null>(null);
@@ -209,6 +218,9 @@ export const Queue:FC = () => {
           setTextPrompt={modelParams.setTextPrompt}
           voicePrompt={modelParams.voicePrompt}
           setVoicePrompt={modelParams.setVoicePrompt}
+          voicesLoading={voicesLoading}
+          voicesError={voicesError}
+          voices={voices}
         />
       )}
     </>
