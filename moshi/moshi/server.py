@@ -426,7 +426,9 @@ def main():
 
     # Download config.json to increment download counter
     # No worries about double-counting since config.json will be cached the second time
-    hf_hub_download(args.hf_repo, "config.json")
+    # Skip when running in offline mode (HF_HUB_OFFLINE=1)
+    if not os.environ.get("HF_HUB_OFFLINE"):
+        hf_hub_download(args.hf_repo, "config.json")
 
     logger.info("loading mimi")
     if args.mimi_weight is None:
