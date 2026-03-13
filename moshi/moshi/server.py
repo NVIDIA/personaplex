@@ -27,11 +27,11 @@
 import argparse
 import asyncio
 from dataclasses import dataclass
+from contextlib import suppress
 import random
 import os
 from pathlib import Path
 import tarfile
-import time
 import secrets
 import sys
 from typing import Literal, Optional
@@ -43,7 +43,6 @@ import numpy as np
 import sentencepiece
 import sphn
 import torch
-import random
 
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
@@ -53,6 +52,15 @@ from .utils.logging import setup_logger, ColorizedLog
 
 logger = setup_logger(__name__)
 DeviceString = Literal["cuda"] | Literal["cpu"] #| Literal["mps"]
+TEXT_TOKEN_EOS = 2
+TEXT_TOKEN_PAD = 3
+LIVE_PROMPT_BOUNDARY_STREAK = 2
+LIVE_PROMPT_MAX_STEPS = 48
+
+
+@dataclass
+class PromptCommand:
+    text: str
 
 def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
     """Return a torch.device based on the requested string or availability."""
@@ -96,12 +104,13 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False, live_prompt_mode: str = "append"):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
+        self.live_prompt_mode = live_prompt_mode
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -115,6 +124,7 @@ class ServerState:
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
+        self.active_prompt_queue: Optional[asyncio.Queue[PromptCommand]] = None
     
     def warmup(self):
         for _ in range(4):
@@ -130,6 +140,20 @@ class ServerState:
 
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
+
+    def set_active_prompt_queue(self, prompt_queue: asyncio.Queue[PromptCommand]):
+        self.active_prompt_queue = prompt_queue
+
+    def clear_active_prompt_queue(self, prompt_queue: asyncio.Queue[PromptCommand]):
+        if self.active_prompt_queue is prompt_queue:
+            self.active_prompt_queue = None
+
+    def queue_live_prompt(self, prompt_text: str) -> bool:
+        prompt_queue = self.active_prompt_queue
+        if prompt_queue is None:
+            return False
+        prompt_queue.put_nowait(PromptCommand(text=prompt_text))
+        return True
 
 
     async def handle_chat(self, request):
@@ -167,8 +191,10 @@ class ServerState:
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
-        seed = int(request["seed"]) if "seed" in request.query else None
+        initial_text_prompt = request.query["text_prompt"].strip()
+        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(initial_text_prompt)) if len(initial_text_prompt) > 0 else None
+        seed = int(request.query["seed"]) if "seed" in request.query else None
+        session_prompt_queue: asyncio.Queue[PromptCommand] = asyncio.Queue()
 
         async def recv_loop():
             nonlocal close
@@ -203,11 +229,82 @@ class ServerState:
 
         async def opus_loop():
             all_pcm_data = None
+            effective_prompt_text = initial_text_prompt
+            pending_prompt_commands: list[PromptCommand] = []
+            prompt_interrupt_active = False
+            boundary_streak = 0
+            boundary_steps = 0
+
+            def drain_prompt_queue():
+                nonlocal prompt_interrupt_active, all_pcm_data
+                while True:
+                    try:
+                        pending_prompt_commands.append(session_prompt_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                if pending_prompt_commands and not prompt_interrupt_active:
+                    prompt_interrupt_active = True
+                    all_pcm_data = None
+                    _ = opus_reader.read_pcm()
+                    clog.log("info", "queued live text prompt; interrupting user audio feed")
+
+            async def emit_tokens(tokens: torch.Tensor):
+                text_token = tokens[0, 0, 0].item()
+                assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+                main_pcm = self.mimi.decode(tokens[:, 1:9])
+                _ = self.other_mimi.decode(tokens[:, 1:9])
+                main_pcm = main_pcm.cpu()
+                opus_writer.append_pcm(main_pcm[0, 0].numpy())
+                if text_token not in (0, TEXT_TOKEN_PAD):
+                    _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
+                    _text = _text.replace("▁", " ")
+                    msg = b"\x02" + bytes(_text, encoding="utf8")
+                    await ws.send_bytes(msg)
+                return text_token
+
+            def build_effective_prompt(new_prompt_text: str) -> str:
+                if self.live_prompt_mode == "replace" or not effective_prompt_text:
+                    return new_prompt_text
+                return f"{effective_prompt_text}\n{new_prompt_text}"
+
+            def inject_prompt(prompt_text: str):
+                nonlocal effective_prompt_text
+                effective_prompt_text = build_effective_prompt(prompt_text)
+                prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(effective_prompt_text))
+                self.lm_gen.step_text_prompt_tokens(prompt_tokens)
+                self.lm_gen.step_audio_silence_frames(self.lm_gen.audio_silence_frame_cnt)
 
             while True:
                 if close:
                     return
                 await asyncio.sleep(0.001)
+                drain_prompt_queue()
+
+                if prompt_interrupt_active:
+                    _ = opus_reader.read_pcm()
+                    silence_tokens = self.lm_gen.step(
+                        moshi_tokens=self.lm_gen._encode_zero_frame(),
+                        text_token=self.lm_gen.zero_text_code,
+                        input_tokens=self.lm_gen._encode_sine_frame(),
+                    )
+                    if silence_tokens is not None:
+                        text_token = await emit_tokens(silence_tokens)
+                        if text_token in (TEXT_TOKEN_EOS, TEXT_TOKEN_PAD):
+                            boundary_streak += 1
+                        else:
+                            boundary_streak = 0
+                    boundary_steps += 1
+                    if boundary_streak >= LIVE_PROMPT_BOUNDARY_STREAK or boundary_steps >= LIVE_PROMPT_MAX_STEPS:
+                        for prompt_command in pending_prompt_commands:
+                            inject_prompt(prompt_command.text)
+                            clog.log("info", f"applied live prompt: {prompt_command.text}")
+                        pending_prompt_commands.clear()
+                        prompt_interrupt_active = False
+                        boundary_streak = 0
+                        boundary_steps = 0
+                        all_pcm_data = None
+                    continue
+
                 pcm = opus_reader.read_pcm()
                 if pcm.shape[-1] == 0:
                     continue
@@ -216,7 +313,6 @@ class ServerState:
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
                 while all_pcm_data.shape[-1] >= self.frame_size:
-                    be = time.time()
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
                     chunk = torch.from_numpy(chunk)
@@ -224,22 +320,15 @@ class ServerState:
                     codes = self.mimi.encode(chunk)
                     _ = self.other_mimi.encode(chunk)
                     for c in range(codes.shape[-1]):
+                        drain_prompt_queue()
+                        if prompt_interrupt_active:
+                            break
                         tokens = self.lm_gen.step(codes[:, :, c: c + 1])
                         if tokens is None:
                             continue
-                        assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
-                        main_pcm = self.mimi.decode(tokens[:, 1:9])
-                        _ = self.other_mimi.decode(tokens[:, 1:9])
-                        main_pcm = main_pcm.cpu()
-                        opus_writer.append_pcm(main_pcm[0, 0].numpy())
-                        text_token = tokens[0, 0, 0].item()
-                        if text_token not in (0, 3):
-                            _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
-                            _text = _text.replace("▁", " ")
-                            msg = b"\x02" + bytes(_text, encoding="utf8")
-                            await ws.send_bytes(msg)
-                        else:
-                            text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+                        await emit_tokens(tokens)
+                    if prompt_interrupt_active or all_pcm_data is None:
+                        break
 
         async def send_loop():
             while True:
@@ -287,26 +376,55 @@ class ServerState:
             if await is_alive():
                 await ws.send_bytes(b"\x00")
                 clog.log("info", "sent handshake bytes")
-                # Clean cancellation manager
-                tasks = [
-                    asyncio.create_task(recv_loop()),
-                    asyncio.create_task(opus_loop()),
-                    asyncio.create_task(send_loop()),
-                ]
+                self.set_active_prompt_queue(session_prompt_queue)
+                try:
+                    # Clean cancellation manager
+                    tasks = [
+                        asyncio.create_task(recv_loop()),
+                        asyncio.create_task(opus_loop()),
+                        asyncio.create_task(send_loop()),
+                    ]
 
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                # Force-kill remaining tasks
-                for task in pending:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                await ws.close()
-                clog.log("info", "session closed")
-                # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
+                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    # Force-kill remaining tasks
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    await ws.close()
+                    clog.log("info", "session closed")
+                    # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
+                finally:
+                    self.clear_active_prompt_queue(session_prompt_queue)
         clog.log("info", "done with connection")
         return ws
+
+
+async def stdin_prompt_loop(state: ServerState):
+    logger.info("live prompt stdin enabled; enter one prompt per line")
+    while True:
+        try:
+            line = await asyncio.to_thread(sys.stdin.readline)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"stdin prompt loop failed: {exc}")
+            return
+
+        if line == "":
+            logger.info("stdin closed; stopping live prompt loop")
+            return
+
+        prompt_text = line.strip()
+        if not prompt_text:
+            continue
+
+        if state.queue_live_prompt(prompt_text):
+            logger.info(f"queued live prompt: {prompt_text}")
+        else:
+            logger.warning("ignored live prompt because no active session is running")
 
 
 def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
@@ -373,6 +491,17 @@ def main():
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
+    parser.add_argument(
+        "--live-prompt-stdin",
+        action="store_true",
+        help="Read one live prompt per line from stdin and inject it into the active session.",
+    )
+    parser.add_argument(
+        "--live-prompt-mode",
+        choices=("append", "replace"),
+        default="append",
+        help="How stdin live prompts combine with the current session prompt.",
+    )
     parser.add_argument(
         "--voice-prompt-dir",
         type=str,
@@ -453,11 +582,27 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        live_prompt_mode=args.live_prompt_mode,
     )
     logger.info("warming up the model")
     state.warmup()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
+    stdin_task: Optional[asyncio.Task] = None
+
+    async def on_startup(_app):
+        nonlocal stdin_task
+        if args.live_prompt_stdin:
+            stdin_task = asyncio.create_task(stdin_prompt_loop(state))
+
+    async def on_cleanup(_app):
+        if stdin_task is not None:
+            stdin_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await stdin_task
+
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
     if static_path is not None:
         async def handle_root(_):
             return web.FileResponse(os.path.join(static_path, "index.html"))

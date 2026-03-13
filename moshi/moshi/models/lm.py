@@ -1109,10 +1109,32 @@ class LMGen(StreamingModule[_LMGenState]):
         for _ in self._step_text_prompt_core():
             pass
 
+    def step_text_prompt_tokens(self, text_prompt_tokens: Optional[list[int]]):
+        if not text_prompt_tokens:
+            return
+        previous_tokens = self.text_prompt_tokens
+        self.text_prompt_tokens = text_prompt_tokens
+        try:
+            self._step_text_prompt()
+        finally:
+            self.text_prompt_tokens = previous_tokens
+
     async def _step_text_prompt_async(self, is_alive: Optional[Callable]=None):
         for _ in self._step_text_prompt_core():
             if is_alive is not None and not await is_alive():
                 break
+
+    def step_audio_silence_frames(self, frame_count: Optional[int] = None):
+        if frame_count is None:
+            self._step_audio_silence()
+            return
+
+        for _ in range(frame_count):
+            self.step(
+                moshi_tokens=self._encode_zero_frame(),
+                text_token=self.zero_text_code,
+                input_tokens=self._encode_sine_frame(),
+            )
 
     async def step_system_prompts_async(self, mimi, is_alive: Optional[Callable]=None):
         await self._step_voice_prompt_async(mimi, is_alive)
@@ -1175,4 +1197,3 @@ class LMGen(StreamingModule[_LMGenState]):
             return tokens, all_logits
         else:
             return tokens
-
