@@ -330,7 +330,14 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
     if not voices_dir.exists():
         logger.info(f"extracting {voices_tgz} to {voices_dir}")
         with tarfile.open(voices_tgz, "r:gz") as tar:
-            tar.extractall(path=voices_tgz.parent, filter='data')
+            if sys.version_info >= (3, 12):
+                tar.extractall(path=voices_tgz.parent, filter='data')
+            else:
+                # Safe extraction fallback for Python < 3.12
+                for member in tar.getmembers():
+                    if member.name.startswith('/') or '..' in member.name:
+                        raise ValueError(f"Unsafe tar member: {member.name}")
+                    tar.extract(member, path=voices_tgz.parent)
 
     if not voices_dir.exists():
         raise RuntimeError("voices.tgz did not contain a 'voices/' directory")
@@ -346,7 +353,14 @@ def _get_static_path(static: Optional[str]) -> Optional[str]:
         dist = dist_tgz.parent / "dist"
         if not dist.exists():
             with tarfile.open(dist_tgz, "r:gz") as tar:
-                tar.extractall(path=dist_tgz.parent, filter='data')
+                if sys.version_info >= (3, 12):
+                    tar.extractall(path=dist_tgz.parent, filter='data')
+                else:
+                    # Safe extraction fallback for Python < 3.12
+                    for member in tar.getmembers():
+                        if member.name.startswith('/') or '..' in member.name:
+                            raise ValueError(f"Unsafe tar member: {member.name}")
+                        tar.extract(member, path=dist_tgz.parent)
         return str(dist)
     elif static != "none":
         # When set to the "none" string, we don't serve any static content.
