@@ -157,7 +157,7 @@ def get_mimi(filename: str | Path,
     if _is_safetensors(filename):
         load_model(model, filename)
     else:
-        pkg = torch.load(filename, "cpu")
+        pkg = torch.load(filename, map_location="cpu", weights_only=True)
         model.load_state_dict(pkg["model"])
     model.set_num_codebooks(8)
     return model
@@ -214,7 +214,7 @@ def get_moshi_lm(
     else:
         # torch checkpoint
         with open(filename, "rb") as f:
-            state_dict = torch.load(f, map_location="cpu")
+            state_dict = torch.load(f, map_location="cpu", weights_only=True)
     # Patch 1: expand depformer self_attn weights if needed
     model_sd = model.state_dict()
     for name, tensor in list(state_dict.items()):
@@ -292,7 +292,7 @@ def _get_moshi_lm_with_offload(
         state_dict = load_file(filename, device="cpu")
     else:
         with open(filename, "rb") as f:
-            state_dict = torch.load(f, map_location="cpu")
+            state_dict = torch.load(f, map_location="cpu", weights_only=True)
 
     # Apply weight patches (same as non-offload path)
     model_sd = model.state_dict()

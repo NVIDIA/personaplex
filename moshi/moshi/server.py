@@ -43,7 +43,6 @@ import numpy as np
 import sentencepiece
 import sphn
 import torch
-import random
 
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
@@ -152,7 +151,13 @@ class ServerState:
             voice_prompt_filename = request.query["voice_prompt"]
             requested_voice_prompt_path = None
             if voice_prompt_filename is not None:
-                requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
+                # Prevent path traversal: strip directory components from client input
+                safe_filename = os.path.basename(voice_prompt_filename)
+                if safe_filename != voice_prompt_filename:
+                    raise ValueError(
+                        f"Invalid voice prompt filename: {voice_prompt_filename!r}"
+                    )
+                requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, safe_filename)
             # If the voice prompt file does not exist, find a valid (s0) voiceprompt file in the directory
             if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
                 raise FileNotFoundError(
@@ -168,7 +173,7 @@ class ServerState:
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
-        seed = int(request["seed"]) if "seed" in request.query else None
+        seed = int(request.query["seed"]) if "seed" in request.query else None
 
         async def recv_loop():
             nonlocal close
@@ -309,6 +314,18 @@ class ServerState:
         return ws
 
 
+def _safe_tar_extract(tar: tarfile.TarFile, path: str | Path) -> None:
+    """Extract tar contents with path traversal protection."""
+    dest = os.path.realpath(str(path))
+    for member in tar.getmembers():
+        member_path = os.path.realpath(os.path.join(dest, member.name))
+        if not member_path.startswith(dest + os.sep) and member_path != dest:
+            raise RuntimeError(
+                f"Refusing to extract {member.name!r}: would write outside {dest}"
+            )
+    tar.extractall(path=path)
+
+
 def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
     """
     If voice_prompt_dir is None:
@@ -330,7 +347,7 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
     if not voices_dir.exists():
         logger.info(f"extracting {voices_tgz} to {voices_dir}")
         with tarfile.open(voices_tgz, "r:gz") as tar:
-            tar.extractall(path=voices_tgz.parent)
+            _safe_tar_extract(tar, voices_tgz.parent)
 
     if not voices_dir.exists():
         raise RuntimeError("voices.tgz did not contain a 'voices/' directory")
@@ -346,7 +363,7 @@ def _get_static_path(static: Optional[str]) -> Optional[str]:
         dist = dist_tgz.parent / "dist"
         if not dist.exists():
             with tarfile.open(dist_tgz, "r:gz") as tar:
-                tar.extractall(path=dist_tgz.parent)
+                _safe_tar_extract(tar, dist_tgz.parent)
         return str(dist)
     elif static != "none":
         # When set to the "none" string, we don't serve any static content.
@@ -465,7 +482,7 @@ def main():
         logger.info(f"serving static content from {static_path}")
         app.router.add_get("/", handle_root)
         app.router.add_static(
-            "/", path=static_path, follow_symlinks=True, name="static"
+            "/", path=static_path, follow_symlinks=False, name="static"
         )
     protocol = "http"
     ssl_context = None
