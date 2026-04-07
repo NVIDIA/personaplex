@@ -43,7 +43,6 @@ import numpy as np
 import sentencepiece
 import sphn
 import torch
-import random
 
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
