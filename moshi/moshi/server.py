@@ -152,7 +152,18 @@ class ServerState:
             voice_prompt_filename = request.query["voice_prompt"]
             requested_voice_prompt_path = None
             if voice_prompt_filename is not None:
+                # Sanitize: use only the basename to prevent path traversal (CWE-22)
+                voice_prompt_filename = os.path.basename(voice_prompt_filename)
+                if not voice_prompt_filename:
+                    raise ValueError("Invalid voice prompt filename")
                 requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
+                # Verify resolved path is within the allowed directory
+                resolved = os.path.realpath(requested_voice_prompt_path)
+                allowed_dir = os.path.realpath(self.voice_prompt_dir)
+                if not resolved.startswith(allowed_dir + os.sep) and resolved != allowed_dir:
+                    raise ValueError(
+                        f"Voice prompt path escapes the allowed directory"
+                    )
             # If the voice prompt file does not exist, find a valid (s0) voiceprompt file in the directory
             if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
                 raise FileNotFoundError(
