@@ -121,7 +121,16 @@ export const useUserAudio = ({
       mediaStream: null,
       source: null,
     };
-  }, [setStatus, onDataChunk, onRecordingStart, onRecordingStop]);
+  }, [
+    audioContext,
+    constraints,
+    getMediaStream,
+    onDataChunk,
+    onRecordingStart,
+    onRecordingStop,
+    setStatus,
+    stereoMerger,
+  ]);
 
   const stopRecording = useCallback(() => {
     setStatus(UserMediaStatuses.STOPPING);

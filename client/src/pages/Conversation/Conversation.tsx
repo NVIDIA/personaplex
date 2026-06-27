@@ -28,6 +28,22 @@ type ConversationProps = {
   startConnection: () => Promise<void>;
 } & Partial<ModelParamsValues>;
 
+const normalizeBrowserHost = (host: string) => {
+  if (host === "0.0.0.0" || host === "::" || host === "[::]") {
+    return "localhost";
+  }
+  return host;
+};
+
+const normalizeWorkerAddr = (workerAddr: string) => {
+  if (workerAddr.startsWith("0.0.0.0:")) {
+    return `localhost:${workerAddr.slice("0.0.0.0:".length)}`;
+  }
+  if (workerAddr.startsWith("[::]:")) {
+    return `localhost:${workerAddr.slice("[::]:".length)}`;
+  }
+  return workerAddr;
+};
 
 const buildURL = ({
   workerAddr,
@@ -44,14 +60,12 @@ const buildURL = ({
   textSeed: number;
   audioSeed: number;
 }) => {
-  const newWorkerAddr = useMemo(() => {
-    if (workerAddr == "same" || workerAddr == "") {
-      const newWorkerAddr = window.location.hostname + ":" + window.location.port;
-      console.log("Overriding workerAddr to", newWorkerAddr);
-      return newWorkerAddr;
-    }
-    return workerAddr;
-  }, [workerAddr]);
+  let newWorkerAddr = normalizeWorkerAddr(workerAddr);
+  if (workerAddr == "same" || workerAddr == "") {
+    const host = normalizeBrowserHost(window.location.hostname);
+    newWorkerAddr = window.location.port ? `${host}:${window.location.port}` : host;
+    console.log("Overriding workerAddr to", newWorkerAddr);
+  }
   const wsProtocol = (window.location.protocol === 'https:') ? 'wss' : 'ws';
   const url = new URL(`${wsProtocol}://${newWorkerAddr}/api/chat`);
   if(workerAuthId) {
@@ -227,6 +241,8 @@ export const Conversation:FC<ConversationProps> = ({
     }
     if (socketStatus === "connected") {
       return 'Disconnect';
+    } else if (socketStatus === "connecting") {
+      return 'Preparing model...';
     } else {
       return 'Connecting...';
     }
