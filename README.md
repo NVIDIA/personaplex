@@ -26,6 +26,14 @@ sudo apt install libopus-dev
 sudo dnf install opus-devel
 ```
 
+On Apple Silicon Macs, use Nix to create a Python environment with the MLX
+runtime and to build the Web UI:
+```bash
+nix-shell
+./scripts/bootstrap-nix-macos.sh
+./scripts/build-client.sh
+```
+
 ### Installation
 
 Download this repository and install with:
@@ -58,9 +66,51 @@ SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR"
 SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --cpu-offload
 ```
 
-Access the Web UI from a browser at `localhost:8998` if running locally, otherwise look for the access link printed by the script:
+Access the Web UI from a browser at `localhost:8998` if running locally, otherwise look for the access links printed by the script:
 ```
-Access the Web UI directly at https://11.54.401.33:8998
+Serving Web UI at https://localhost:8998
+Serving Web UI on LAN at https://<LAN_IP>:8998
+```
+
+On Apple Silicon Macs, `--device auto` resolves to MPS and starts the MLX
+runtime when `model-mlx/` is available. You can also make it explicit with
+`--device mps`:
+```bash
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --device auto
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --device mps
+```
+
+If `./model` exists, the server uses it before Hugging Face downloads:
+`model/model.safetensors`, `model/tokenizer.safetensors`, and `model/voices`.
+The text tokenizer is a separate SentencePiece file; put
+`tokenizer_spm_32k_3.model` in `./model` or export `HF_TOKEN` after accepting the
+model license so it can be downloaded.
+
+### Convert Weights for MLX
+
+Convert a standard PersonaPlex/Moshi checkpoint directory or `model.safetensors`
+file into an MLX bundle:
+```bash
+python -m moshi.convert_mlx \
+  --input model \
+  --output-dir model-mlx \
+  --force \
+  --moshi-mlx-native on
+```
+
+The converter writes both `model-mlx/model.safetensors` and the native
+`model-mlx/model.moshi_mlx.safetensors` used by `moshi_mlx`. It also writes the
+MLX runtime `config.json`, copies local side assets such as tokenizer/Mimi files
+and `voices/`, then validates the standard safetensors file with
+`mlx.core.load`. Use `--self-test` to verify the conversion path without the full
+model:
+```bash
+python -m moshi.convert_mlx --self-test
+```
+
+After conversion, this starts the local MLX model on macOS:
+```bash
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --device mps
 ```
 
 ### Offline Evaluation

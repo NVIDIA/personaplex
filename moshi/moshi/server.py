@@ -39,6 +39,7 @@ from typing import Literal, Optional
 import aiohttp
 from aiohttp import web
 from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import HfHubHTTPError
 import numpy as np
 import sentencepiece
 import sphn
@@ -52,16 +53,17 @@ from .utils.logging import setup_logger, ColorizedLog
 
 
 logger = setup_logger(__name__)
-DeviceString = Literal["cuda"] | Literal["cpu"] #| Literal["mps"]
+DeviceString = Literal["auto", "cuda", "cpu", "mps"]
+MOSHI_MLX_NATIVE_NAME = "model.moshi_mlx.safetensors"
 
 def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
     """Return a torch.device based on the requested string or availability."""
-    if requested is not None:
+    if requested not in (None, "auto"):
         return torch.device(requested)
     if torch.cuda.is_available():
         return torch.device("cuda")
-    #elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    #    return torch.device("mps")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -86,6 +88,182 @@ def wrap_with_system_tags(text: str) -> str:
     return f"<system> {cleaned} <system>"
 
 
+def _optional_path(path: str | Path | None) -> Path | None:
+    if path is None:
+        return None
+    if str(path).lower() in {"", "none"}:
+        return None
+    expanded = Path(path).expanduser()
+    return expanded if expanded.exists() else None
+
+
+def _find_local_file(root: Path | None, *names: str) -> Path | None:
+    if root is None:
+        return None
+    for name in names:
+        candidate = root / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_voice_prompt_path(voice_prompt_dir: str, requested: str | None) -> Path:
+    if requested is None or requested == "":
+        raise FileNotFoundError(f"No voice prompt requested from '{voice_prompt_dir}'")
+
+    requested_path = Path(requested)
+    if requested_path.name != requested:
+        raise FileNotFoundError(f"Invalid voice prompt name '{requested}'")
+
+    root = Path(voice_prompt_dir)
+    candidate = root / requested
+    if candidate.exists():
+        return candidate
+
+    stem = requested_path.stem
+    for suffix in (".safetensors", ".pt", ".pth", ".wav", ".mp3", ".flac", ".ogg"):
+        candidate = root / f"{stem}{suffix}"
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(f"Requested voice prompt '{requested}' not found in '{voice_prompt_dir}'")
+
+
+def _is_voice_prompt_embeddings(path: str | Path) -> bool:
+    return Path(path).suffix in {".safetensors", ".pt", ".pth"}
+
+
+def _browser_host(host: str) -> str:
+    if host in ("0.0.0.0", "::", "", "localhost"):
+        return "localhost"
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
+def _log_server_urls(protocol: str, host: str, port: int) -> None:
+    local_url = f"{protocol}://{_browser_host(host)}:{port}"
+    logger.info(f"Serving Web UI at {local_url}")
+    if host in ("0.0.0.0", "::", ""):
+        lan_ip = get_lan_ip()
+        if lan_ip not in ("127.0.0.1", "localhost"):
+            logger.info(f"Serving Web UI on LAN at {protocol}://{lan_ip}:{port}")
+
+
+def _download_or_explain(hf_repo: str, filename: str, purpose: str) -> str:
+    try:
+        return hf_hub_download(hf_repo, filename)
+    except HfHubHTTPError:
+        raise SystemExit(
+            f"Could not download {purpose} ({filename}) from {hf_repo}. "
+            "If you want Hugging Face downloads, accept the model license and export HF_TOKEN. "
+            "For offline/local startup, pass the local file explicitly or place it under --model-dir."
+        ) from None
+
+
+def _apply_local_model_defaults(args) -> Path | None:
+    model_dir = _optional_path(args.model_dir)
+    if model_dir is None:
+        return None
+
+    if args.voice_prompt_dir is None and (model_dir / "voices").exists():
+        args.voice_prompt_dir = str(model_dir / "voices")
+    if args.moshi_weight is None:
+        local_moshi = _find_local_file(model_dir, loaders.MOSHI_NAME, "model.safetensors")
+        if local_moshi is not None:
+            args.moshi_weight = str(local_moshi)
+    if args.mimi_weight is None:
+        local_mimi = _find_local_file(model_dir, loaders.MIMI_NAME, "tokenizer.safetensors")
+        if local_mimi is not None:
+            args.mimi_weight = str(local_mimi)
+    if args.tokenizer is None:
+        local_tokenizer = _find_local_file(model_dir, loaders.TEXT_TOKENIZER_NAME)
+        if local_tokenizer is not None:
+            args.tokenizer = str(local_tokenizer)
+
+    if args.static is None:
+        for candidate in (model_dir / "dist", Path("client/dist")):
+            if candidate.exists():
+                args.static = str(candidate)
+                break
+        else:
+            args.static = "none"
+            logger.info("no local static UI found; serving API only. Build client/dist or pass --static to serve UI.")
+
+    return model_dir
+
+
+def _require_existing_path(path: Path, purpose: str) -> Path:
+    if not path.exists():
+        raise SystemExit(f"Missing {purpose}: {path}")
+    return path
+
+
+def _run_mlx_server(args, static_path: str | None) -> None:
+    mlx_dir = _require_existing_path(Path(args.mlx_model_dir).expanduser(), "MLX model directory")
+    moshi_weight = Path(args.moshi_weight).expanduser() if args.moshi_weight else mlx_dir / MOSHI_MLX_NATIVE_NAME
+    mimi_weight = Path(args.mimi_weight).expanduser() if args.mimi_weight else (
+        _find_local_file(mlx_dir, "tokenizer.safetensors", loaders.MIMI_NAME) or mlx_dir / "tokenizer.safetensors"
+    )
+    if args.tokenizer:
+        tokenizer = Path(args.tokenizer).expanduser()
+    else:
+        tokenizer = (
+            _find_local_file(mlx_dir, loaders.TEXT_TOKENIZER_NAME)
+            or _find_local_file(_optional_path(args.model_dir), loaders.TEXT_TOKENIZER_NAME)
+        )
+        if tokenizer is None:
+            tokenizer = Path(_download_or_explain(args.hf_repo, loaders.TEXT_TOKENIZER_NAME, "text tokenizer"))
+    lm_config = mlx_dir / "config.json"
+
+    if not moshi_weight.exists() and (mlx_dir / loaders.MOSHI_NAME).exists():
+        raise SystemExit(
+            f"Missing MLX-native Moshi weights: {moshi_weight}\n"
+            "Create them with:\n"
+            f"  python -m moshi.convert_mlx --input {args.model_dir} --output-dir {args.mlx_model_dir} "
+            "--force --moshi-mlx-native on"
+        )
+
+    _require_existing_path(moshi_weight, "MLX-native Moshi weights")
+    _require_existing_path(mimi_weight, "Mimi tokenizer")
+    _require_existing_path(tokenizer, "text tokenizer")
+    _require_existing_path(lm_config, "MLX model config")
+
+    try:
+        from moshi_mlx import local_web as mlx_local_web
+    except Exception as exc:
+        raise SystemExit(
+            "moshi_mlx is required for --device mps. "
+            "Run ./scripts/bootstrap-nix-macos.sh to install the MLX runtime."
+        ) from exc
+
+    host = "localhost" if args.host in ("0.0.0.0", "::", "") else args.host
+    argv = [
+        "moshi_mlx.local_web",
+        "--moshi-weight", str(moshi_weight),
+        "--mimi-weight", str(mimi_weight),
+        "--tokenizer", str(tokenizer),
+        "--lm-config", str(lm_config),
+        "--host", host,
+        "--port", str(args.port),
+        "--no-browser",
+    ]
+    if static_path is not None:
+        argv.extend(["--static", static_path])
+    else:
+        argv.extend(["--static", "none"])
+    if args.ssl is not None:
+        create_ssl_context(args.ssl)
+        argv.extend(["--ssl", args.ssl])
+
+    logger.info("device=mps selected; launching moshi_mlx runtime")
+    logger.info(f"MLX model_dir = {mlx_dir}")
+    original_argv = sys.argv
+    try:
+        sys.argv = argv
+        mlx_local_web.main()
+    finally:
+        sys.argv = original_argv
+
+
 @dataclass
 class ServerState:
     mimi: MimiModel
@@ -96,12 +274,13 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False, prompt_prefill: bool = True):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
+        self.prompt_prefill = prompt_prefill
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -145,30 +324,23 @@ class ServerState:
         # self.lm_gen.top_k_text = max(1, int(request.query["text_topk"]))
         # self.lm_gen.top_k = max(1, int(request.query["audio_topk"]))
         
-        # Construct full voice prompt path
-        requested_voice_prompt_path = None
+        text_prompt = request.query.get("text_prompt", "")
         voice_prompt_path = None
         if self.voice_prompt_dir is not None:
-            voice_prompt_filename = request.query["voice_prompt"]
-            requested_voice_prompt_path = None
-            if voice_prompt_filename is not None:
-                requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
-            # If the voice prompt file does not exist, find a valid (s0) voiceprompt file in the directory
-            if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
-                raise FileNotFoundError(
-                    f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
-                )
-            else:
-                voice_prompt_path = requested_voice_prompt_path
-                
-        if self.lm_gen.voice_prompt != voice_prompt_path:
-            if voice_prompt_path.endswith('.pt'):
+            voice_prompt_filename = request.query.get("voice_prompt")
+            voice_prompt_path = str(_resolve_voice_prompt_path(self.voice_prompt_dir, voice_prompt_filename))
+
+        if voice_prompt_path is not None and self.lm_gen.voice_prompt != voice_prompt_path:
+            if _is_voice_prompt_embeddings(voice_prompt_path):
                 # Load pre-saved voice prompt embeddings
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
-        seed = int(request["seed"]) if "seed" in request.query else None
+        self.lm_gen.text_prompt_tokens = (
+            self.text_tokenizer.encode(wrap_with_system_tags(text_prompt))
+            if len(text_prompt) > 0 else None
+        )
+        seed = int(request.query["seed"]) if "seed" in request.query else None
 
         async def recv_loop():
             nonlocal close
@@ -216,7 +388,6 @@ class ServerState:
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
                 while all_pcm_data.shape[-1] >= self.frame_size:
-                    be = time.time()
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
                     chunk = torch.from_numpy(chunk)
@@ -238,8 +409,6 @@ class ServerState:
                             _text = _text.replace("▁", " ")
                             msg = b"\x02" + bytes(_text, encoding="utf8")
                             await ws.send_bytes(msg)
-                        else:
-                            text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
 
         async def send_loop():
             while True:
@@ -251,10 +420,10 @@ class ServerState:
                     await ws.send_bytes(b"\x01" + msg)
 
         clog.log("info", "accepted connection")
-        if len(request.query["text_prompt"]) > 0:
-            clog.log("info", f"text prompt: {request.query['text_prompt']}")
-        if len(request.query["voice_prompt"]) > 0:
-            clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {requested_voice_prompt_path})")
+        if len(text_prompt) > 0:
+            clog.log("info", f"text prompt: {text_prompt}")
+        if voice_prompt_path is not None:
+            clog.log("info", f"voice prompt: {voice_prompt_path}")
         close = False
         async with self.lock:
             if seed is not None and seed != -1:
@@ -266,28 +435,20 @@ class ServerState:
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
             async def is_alive():
-                if close or ws.closed:
-                    return False
-                try:
-                    # Check for disconnect without waiting too long
-                    msg = await asyncio.wait_for(ws.receive(), timeout=0.01)
-                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        return False
-                except asyncio.TimeoutError:
-                    # No messages → client probably still alive
-                    return True
-                except aiohttp.ClientConnectionError:
-                    return False
-                return True
-            # Reuse mimi for encoding voice prompt and then reset it before conversation starts
-            await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
-            self.mimi.reset_streaming()
-            clog.log("info", "done with system prompts")
-            # Send the handshake.
+                return not close and not ws.closed
+
+            if self.prompt_prefill:
+                # Reuse mimi for encoding voice prompt and then reset it before conversation starts.
+                prompt_start = time.time()
+                clog.log("info", "loading system prompts")
+                await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
+                self.mimi.reset_streaming()
+                clog.log("info", f"done with system prompts in {time.time() - prompt_start:.2f}s")
+            else:
+                clog.log("warning", "skipping system prompt prefill for this backend")
             if await is_alive():
                 await ws.send_bytes(b"\x00")
                 clog.log("info", "sent handshake bytes")
-                # Clean cancellation manager
                 tasks = [
                     asyncio.create_task(recv_loop()),
                     asyncio.create_task(opus_loop()),
@@ -323,7 +484,7 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
 
     logger.info("retrieving voice prompts")
 
-    voices_tgz = hf_hub_download(hf_repo, "voices.tgz")
+    voices_tgz = _download_or_explain(hf_repo, "voices.tgz", "voice prompts")
     voices_tgz = Path(voices_tgz)
     voices_dir = voices_tgz.parent / "voices"
 
@@ -338,10 +499,10 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
     return str(voices_dir)
 
 
-def _get_static_path(static: Optional[str]) -> Optional[str]:
+def _get_static_path(static: Optional[str], hf_repo: str) -> Optional[str]:
     if static is None:
         logger.info("retrieving the static content")
-        dist_tgz = hf_hub_download("nvidia/personaplex-7b-v1", "dist.tgz")
+        dist_tgz = _download_or_explain(hf_repo, "dist.tgz", "static Web UI")
         dist_tgz = Path(dist_tgz)
         dist = dist_tgz.parent / "dist"
         if not dist.exists():
@@ -354,9 +515,10 @@ def _get_static_path(static: Optional[str]) -> Optional[str]:
     return None
 
 
+@torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="localhost", type=str)
+    parser.add_argument("--host", default="0.0.0.0", type=str)
     parser.add_argument("--port", default=8998, type=int)
     parser.add_argument("--static", type=str)
     parser.add_argument("--gradio-tunnel", action='store_true', help='Activate a gradio tunnel.')
@@ -366,13 +528,23 @@ def main():
     parser.add_argument("--tokenizer", type=str, help="Path to a local tokenizer file.")
     parser.add_argument("--moshi-weight", type=str, help="Path to a local checkpoint file for Moshi.")
     parser.add_argument("--mimi-weight", type=str, help="Path to a local checkpoint file for Mimi.")
+    parser.add_argument("--model-dir", type=str, default="model",
+                        help="Local model directory to use before Hugging Face downloads. Defaults to ./model.")
+    parser.add_argument("--mlx-model-dir", type=str, default="model-mlx",
+                        help="Local MLX model directory used when --device resolves to mps. Defaults to ./model-mlx.")
     parser.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO,
                         help="HF repo to look into, defaults PersonaPlex. "
                              "Use this to select a different pre-trained model.")
-    parser.add_argument("--device", type=str, default="cuda", help="Device on which to run, defaults to 'cuda'.")
+    parser.add_argument("--device", type=str, default="auto",
+                        help="Device on which to run: auto, cuda, mps, or cpu. Defaults to auto.")
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
+    parser.add_argument("--prompt-prefill", choices=("auto", "on", "off"), default="auto",
+                        help="Apply voice/text prompts before accepting audio. "
+                             "Defaults to on for CUDA and off for MPS/CPU.")
+    parser.add_argument("--warmup", choices=("auto", "on", "off"), default="auto",
+                        help="Run model warmup before serving. Defaults to on for CUDA and off for MPS/CPU.")
     parser.add_argument(
         "--voice-prompt-dir",
         type=str,
@@ -392,6 +564,10 @@ def main():
     )
 
     args = parser.parse_args()
+    explicit_moshi_weight = args.moshi_weight is not None
+    explicit_mimi_weight = args.mimi_weight is not None
+    explicit_tokenizer = args.tokenizer is not None
+    model_dir = _apply_local_model_defaults(args)
     args.voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
         args.hf_repo,
@@ -401,12 +577,36 @@ def main():
             f"Directory missing: {args.voice_prompt_dir}"
     logger.info(f"voice_prompt_dir = {args.voice_prompt_dir}")
 
-    static_path: None | str = _get_static_path(args.static)
+    static_path: None | str = _get_static_path(args.static, args.hf_repo)
     assert static_path is None or os.path.exists(static_path), \
         f"Static path does not exist: {static_path}."
     logger.info(f"static_path = {static_path}")
     args.device = torch_auto_device(args.device)
 
+    logger.info(f"device = {args.device}")
+    if args.device.type == "mps":
+        if not explicit_moshi_weight:
+            args.moshi_weight = None
+        if not explicit_mimi_weight:
+            args.mimi_weight = None
+        if not explicit_tokenizer:
+            args.tokenizer = None
+        _run_mlx_server(args, static_path)
+        return
+    prompt_prefill = (
+        args.prompt_prefill == "on"
+        or (args.prompt_prefill == "auto" and args.device.type == "cuda")
+    )
+    if not prompt_prefill and args.prompt_prefill == "auto":
+        logger.warning(
+            f"prompt prefill disabled on {args.device.type}; "
+            "use --prompt-prefill on to force voice/text prompt conditioning."
+        )
+    logger.info(f"prompt_prefill = {prompt_prefill}")
+    run_warmup = args.warmup == "on" or (args.warmup == "auto" and args.device.type == "cuda")
+    if not run_warmup and args.warmup == "auto":
+        logger.warning(f"warmup disabled on {args.device.type}; use --warmup on to force it.")
+    logger.info(f"warmup = {run_warmup}")
     seed_all(42424242)
 
     setup_tunnel = None
@@ -424,24 +624,26 @@ def main():
         else:
             tunnel_token = args.gradio_tunnel_token
 
-    # Download config.json to increment download counter
-    # No worries about double-counting since config.json will be cached the second time
-    hf_hub_download(args.hf_repo, "config.json")
+    if _find_local_file(model_dir, "config.json") is None:
+        # Download config.json to increment download counter. Skip this in
+        # local model-dir mode because gated repos require authentication.
+        _download_or_explain(args.hf_repo, "config.json", "model config")
+
+    if args.mimi_weight is None:
+        args.mimi_weight = _download_or_explain(args.hf_repo, loaders.MIMI_NAME, "Mimi weights")
+    if args.tokenizer is None:
+        args.tokenizer = _download_or_explain(args.hf_repo, loaders.TEXT_TOKENIZER_NAME, "text tokenizer")
+    if args.moshi_weight is None:
+        args.moshi_weight = _download_or_explain(args.hf_repo, loaders.MOSHI_NAME, "Moshi LM weights")
 
     logger.info("loading mimi")
-    if args.mimi_weight is None:
-        args.mimi_weight = hf_hub_download(args.hf_repo, loaders.MIMI_NAME)
     mimi = loaders.get_mimi(args.mimi_weight, args.device)
     other_mimi = loaders.get_mimi(args.mimi_weight, args.device)
     logger.info("mimi loaded")
 
-    if args.tokenizer is None:
-        args.tokenizer = hf_hub_download(args.hf_repo, loaders.TEXT_TOKENIZER_NAME)
     text_tokenizer = sentencepiece.SentencePieceProcessor(args.tokenizer)  # type: ignore
 
     logger.info("loading moshi")
-    if args.moshi_weight is None:
-        args.moshi_weight = hf_hub_download(args.hf_repo, loaders.MOSHI_NAME)
     lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
     lm.eval()
     logger.info("moshi loaded")
@@ -453,9 +655,11 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        prompt_prefill=prompt_prefill,
     )
-    logger.info("warming up the model")
-    state.warmup()
+    if run_warmup:
+        logger.info("warming up the model")
+        state.warmup()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
     if static_path is not None:
@@ -471,13 +675,11 @@ def main():
     ssl_context = None
     if args.ssl is not None:
         ssl_context, protocol = create_ssl_context(args.ssl)
-    host_ip = args.host if args.host not in ("0.0.0.0", "::", "localhost") else get_lan_ip()
-    logger.info(f"Access the Web UI directly at {protocol}://{host_ip}:{args.port}")
+    _log_server_urls(protocol, args.host, args.port)
     if setup_tunnel is not None:
         tunnel = setup_tunnel('localhost', args.port, tunnel_token, None)
         logger.info(f"Tunnel started, if executing on a remote GPU, you can use {tunnel}.")
-    web.run_app(app, port=args.port, ssl_context=ssl_context)
+    web.run_app(app, host=args.host, port=args.port, ssl_context=ssl_context, print=None)
 
-
-with torch.no_grad():
+if __name__ == "__main__":
     main()

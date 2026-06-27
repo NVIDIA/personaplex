@@ -13,21 +13,19 @@ class MoshiProcessor extends AudioWorkletProcessor {
     console.log("Moshi processor lives", currentFrame, sampleRate);
     console.log(currentTime);
 
-    // Buffer length definitions
-    let frameSize = asSamples(80);
-    // initialBufferSamples: we wait to have at least that many samples before starting to play
-    this.initialBufferSamples = 1 * frameSize;
-    // once we have enough samples, we further wait that long before starting to play.
-    // This allows to have buffer lengths that are not a multiple of frameSize.
-    this.partialBufferSamples = asSamples(10);
-    // If the buffer length goes over that many, we will drop the oldest packets until
-    // we reach back initialBufferSamples + partialBufferSamples.
-    this.maxBufferSamples = asSamples(10);
+    // Buffer length definitions. MLX generation can arrive in bursts with
+    // long gaps between bursts, so keep enough decoded PCM to bridge jitter
+    // instead of dropping almost every burst above one frame.
+    this.frameSize = asSamples(80);
+    this.initialBufferBaseSamples = asSamples(1200);
+    this.partialBufferBaseSamples = asSamples(240);
+    this.dropTargetBufferSamples = asSamples(8000);
+    this.maxBufferBaseSamples = asSamples(20000);
     // increments
-    this.partialBufferIncrement = asSamples(5);
-    this.maxPartialWithIncrements = asSamples(80);
-    this.maxBufferSamplesIncrement = asSamples(5);
-    this.maxMaxBufferWithIncrements = asSamples(80);
+    this.partialBufferIncrement = asSamples(160);
+    this.maxPartialWithIncrements = asSamples(3000);
+    this.maxBufferSamplesIncrement = asSamples(2000);
+    this.maxMaxBufferWithIncrements = asSamples(60000);
 
     // State and metrics
     this.initState();
@@ -49,8 +47,8 @@ class MoshiProcessor extends AudioWorkletProcessor {
       }
       if (this.currentSamples() >= this.totalMaxBufferSamples()) {
         console.log(this.timestamp(), "Dropping packets", asMs(this.currentSamples()), asMs(this.totalMaxBufferSamples()));
-        let target = this.initialBufferSamples + this.partialBufferSamples
-        while (this.currentSamples() > (this.initialBufferSamples + this.partialBufferSamples)) {
+        let target = this.targetBufferSamples();
+        while (this.currentSamples() > target) {
           let first = this.frames[0];
           let to_remove = this.currentSamples() - target;
           to_remove = Math.min(first.length - this.offsetInFirstBuffer, to_remove);
@@ -93,13 +91,20 @@ class MoshiProcessor extends AudioWorkletProcessor {
     // Debug
     this.pidx = 0;
 
-    // For now let's reset the buffer params.
-    this.partialBufferSamples = asSamples(10);
-    this.maxBufferSamples = asSamples(10);
+    this.initialBufferSamples = this.initialBufferBaseSamples;
+    this.partialBufferSamples = this.partialBufferBaseSamples;
+    this.maxBufferSamples = this.maxBufferBaseSamples;
   }
 
   totalMaxBufferSamples() {
     return this.maxBufferSamples + this.partialBufferSamples + this.initialBufferSamples;
+  }
+
+  targetBufferSamples() {
+    return Math.max(
+      this.initialBufferSamples + this.partialBufferSamples,
+      this.dropTargetBufferSamples,
+    );
   }
 
   timestamp() {

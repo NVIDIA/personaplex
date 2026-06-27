@@ -63,6 +63,17 @@ def log(level: str, msg: str):
     print(make_log(level, msg))
 
 
+def torch_auto_device(requested: Optional[str] = None) -> torch.device:
+    """Return a torch.device based on the requested string or availability."""
+    if requested not in (None, "auto"):
+        return torch.device(requested)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def seed_all(seed: int):
     """Seed torch, CUDA, numpy, and Python RNG for reproducible runs.
 
@@ -375,7 +386,10 @@ def main():
         "--greedy", action="store_true", help="Disable sampling (greedy decoding)"
     )
     parser.add_argument(
-        "--device", type=str, default="cuda", help="Device on which to run, defaults to 'cuda'."
+        "--device",
+        type=str,
+        default="auto",
+        help="Device on which to run: auto, cuda, mps, or cpu. Defaults to auto.",
     )
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
@@ -415,7 +429,7 @@ def main():
             moshi_weight=args.moshi_weight,
             mimi_weight=args.mimi_weight,
             hf_repo=args.hf_repo,
-            device=args.device,
+            device=torch_auto_device(args.device),
             seed=args.seed,
             temp_audio=args.temp_audio,
             temp_text=args.temp_text,
