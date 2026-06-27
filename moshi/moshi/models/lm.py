@@ -35,6 +35,8 @@ from functools import partial
 from os.path import splitext
 import logging
 import numpy as np
+from pathlib import Path
+import struct
 import sys
 from typing import Optional, Union, List, Tuple, Callable, Iterator
 import sphn
@@ -55,6 +57,42 @@ AUDIO_TOKENS_PER_STREAM = 8
 FRAME_RATE_HZ = 12.5
 SILENCE_TOKENS = np.array([948, 243, 1178, 546, 1736, 1030, 1978, 2008], dtype=np.int64)
 SINE_TOKENS    = np.array([430, 1268, 381, 1611, 1095, 1495, 56, 472], dtype=np.int64)
+VOICE_PROMPT_EMBEDDING_CHUNK_SIZE = 8
+
+
+def _looks_like_safetensors(path: str) -> bool:
+    if Path(path).suffix == ".safetensors":
+        return True
+    try:
+        with open(path, "rb") as handle:
+            size_bytes = handle.read(8)
+            if len(size_bytes) != 8:
+                return False
+            header_size = struct.unpack("<Q", size_bytes)[0]
+            if header_size <= 0 or header_size > 16 * 1024 * 1024:
+                return False
+            header = handle.read(header_size)
+    except OSError:
+        return False
+    return header.lstrip().startswith(b"{") and b"data_offsets" in header
+
+
+def _load_voice_prompt_embedding_state(path: str):
+    if _looks_like_safetensors(path):
+        from safetensors.torch import load_file
+
+        return load_file(path, device="cpu")
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _module_floating_dtype(module: torch.nn.Module) -> torch.dtype:
+    for parameter in module.parameters():
+        if parameter.is_floating_point():
+            return parameter.dtype
+    return torch.float32
 
 
 @dataclass
@@ -976,11 +1014,28 @@ class LMGen(StreamingModule[_LMGenState]):
 
     def load_voice_prompt_embeddings(self, path: str):
         self.voice_prompt = path
-        state = torch.load(path)
+        state = _load_voice_prompt_embedding_state(path)
+        target_dtype = _module_floating_dtype(self.lm_model)
 
         self.voice_prompt_audio = None
-        self.voice_prompt_embeddings = state["embeddings"].to(self.lm_model.device)
+        self.voice_prompt_embeddings = state["embeddings"].to(
+            device=self.lm_model.device,
+            dtype=target_dtype,
+        )
         self.voice_prompt_cache = state["cache"].to(self.lm_model.device)
+
+    def _voice_prompt_embedding_sequence(self) -> torch.Tensor:
+        embeddings = self.voice_prompt_embeddings
+        if embeddings is None:
+            raise RuntimeError("Voice prompt embeddings are not loaded")
+        if embeddings.dim() == 4:
+            steps, batch, frames, dim = embeddings.shape
+            embeddings = embeddings.permute(1, 0, 2, 3).reshape(batch, steps * frames, dim)
+        elif embeddings.dim() == 3:
+            embeddings = embeddings.transpose(0, 1).contiguous()
+        else:
+            raise ValueError(f"Unexpected voice prompt embedding shape: {tuple(embeddings.shape)}")
+        return embeddings.contiguous()
 
     def _encode_zero_frame(self) -> torch.Tensor:
         return torch.as_tensor(
@@ -1029,13 +1084,16 @@ class LMGen(StreamingModule[_LMGenState]):
         consult `is_alive`. The core itself is intentionally unaware of connection state.
         """
         if self.voice_prompt_embeddings is not None:
-            # Replay stored voice prompt embeddings
-            for next_embed in self.voice_prompt_embeddings:
+            embeddings = self._voice_prompt_embedding_sequence()
+            for start in range(0, embeddings.shape[1], VOICE_PROMPT_EMBEDDING_CHUNK_SIZE):
                 yield
-                self.step_embeddings(next_embed)
-
+                self.lm_model.transformer(
+                    embeddings[:, start : start + VOICE_PROMPT_EMBEDDING_CHUNK_SIZE]
+                )
             state = self._streaming_state
             state.cache.copy_(self.voice_prompt_cache)
+            state.provided[:] = False
+            state.offset = int(embeddings.shape[1]) + 1
             return
 
         elif self.voice_prompt_audio is not None:
@@ -1094,6 +1152,8 @@ class LMGen(StreamingModule[_LMGenState]):
                 break
 
     def _step_text_prompt_core(self) -> Iterator[None]:
+        if self.text_prompt_tokens is None:
+            return
         for text_prompt_token in self.text_prompt_tokens:
             yield
             self.step(
@@ -1175,4 +1235,3 @@ class LMGen(StreamingModule[_LMGenState]):
             return tokens, all_logits
         else:
             return tokens
-

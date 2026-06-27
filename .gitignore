@@ -123,6 +123,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-nix
 env/
 venv/
 ENV/
@@ -179,6 +180,10 @@ laurent/cuda-test/check
 client/node_modules
 timings.json
 mlx-trace.json
+
+# Local model artifacts
+/model/
+/model-mlx/
 
 # Include everything in assets
 !assets/
