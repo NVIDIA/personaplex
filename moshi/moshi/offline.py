@@ -90,35 +90,39 @@ def wrap_with_system_tags(text: str) -> str:
     return f"<system> {cleaned} <system>"
 
 
-def warmup(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, device: str, frame_size: int):
+def warmup(mimi: MimiModel, other_mimi: Optional[MimiModel], lm_gen: LMGen, device: str, frame_size: int):
     """Run a short warmup loop to initialize CUDA graphs and streaming state.
 
     Replicates the same warmup behavior as server.py: zeros → encode → LMGen.step → decode.
     """
+    wdtype = next(mimi.parameters()).dtype
     for _ in range(4):
-        chunk = torch.zeros(1, 1, frame_size, dtype=torch.float32, device=device)
+        chunk = torch.zeros(1, 1, frame_size, dtype=wdtype, device=device)
         codes = mimi.encode(chunk)
-        _ = other_mimi.encode(chunk)
+        if other_mimi is not None:
+            _ = other_mimi.encode(chunk)
         for c in range(codes.shape[-1]):
             tokens = lm_gen.step(codes[:, :, c : c + 1])
             if tokens is None:
                 continue
             # Decode agent audio channels to ensure decode graphs/states are primed
             _ = mimi.decode(tokens[:, 1:9])
-            _ = other_mimi.decode(tokens[:, 1:9])
+            if other_mimi is not None:
+                _ = other_mimi.decode(tokens[:, 1:9])
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
-def decode_tokens_to_pcm(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, tokens: torch.Tensor) -> np.ndarray:
+def decode_tokens_to_pcm(mimi: MimiModel, other_mimi: Optional[MimiModel], lm_gen: LMGen, tokens: torch.Tensor) -> np.ndarray:
     """Decode a single step of model tokens to PCM using Mimi.
 
     tokens is shaped [B, dep_q+1, 1]; channels 1..dep_q are the agent audio codebooks.
     Returns a 1D float32 numpy array (mono) for the current frame.
     """
     pcm = mimi.decode(tokens[:, 1:9])
-    _ = other_mimi.decode(tokens[:, 1:9])
-    pcm = pcm.detach().cpu().numpy()[0, 0]
+    if other_mimi is not None:
+        _ = other_mimi.decode(tokens[:, 1:9])
+    pcm = pcm.float().detach().cpu().numpy()[0, 0]
     return pcm
 
 
@@ -169,6 +173,11 @@ def run_inference(
     greedy: bool,
     save_voice_prompt_embeddings: bool,
     cpu_offload: bool = False,
+    dep_q_exit: Optional[int] = None,
+    skip_other_mimi: bool = False,
+    mimi_fp16: bool = False,
+    fp8: bool = False,
+    w8a16: bool = False,
 ):
     """Run offline inference using an input WAV as the user-side stream.
 
@@ -191,7 +200,16 @@ def run_inference(
     if mimi_weight is None:
         mimi_weight = hf_hub_download(hf_repo, loaders.MIMI_NAME)  # type: ignore
     mimi = loaders.get_mimi(mimi_weight, device)
-    other_mimi = loaders.get_mimi(mimi_weight, device)
+    # The second mimi stream is pure discarded work in this path (its
+    # encode/decode outputs are assigned to _ and its state is read
+    # nowhere; same in server.py lines 123/129/225/232).
+    other_mimi = None if skip_other_mimi else loaders.get_mimi(mimi_weight, device)
+    if mimi_fp16:
+        mimi = mimi.half()
+        mimi.torch_compile_encoder_decoder = True  # unlock torch_compile_lazy
+        if other_mimi is not None:
+            other_mimi = other_mimi.half()
+            other_mimi.torch_compile_encoder_decoder = True
     log("info", "mimi loaded")
 
     # 2) Load tokenizer
@@ -205,6 +223,24 @@ def run_inference(
         moshi_weight = hf_hub_download(hf_repo, loaders.MOSHI_NAME)  # type: ignore
     lm = loaders.get_moshi_lm(moshi_weight, device=device, cpu_offload=cpu_offload)
     lm.eval()
+    if fp8:
+        if not torch.cuda.is_available():
+            raise RuntimeError("--fp8 requires a CUDA device.")
+        cc = torch.cuda.get_device_capability()
+        if cc < (8, 9):
+            raise RuntimeError(
+                f"--fp8 requires compute capability >= 8.9 for FP8 "
+                f"torch._scaled_mm (found sm_{cc[0]}{cc[1]}).")
+        if not hasattr(torch, "_scaled_mm"):
+            raise RuntimeError(
+                "--fp8 requires torch._scaled_mm (torch >= 2.2 CUDA build).")
+        from .fp8_quantize import quantize_model
+        log("info", "applying FP8 quantization")
+        quantize_model(lm)
+    elif w8a16:
+        from .w8a16_quantize import quantize_model_w8a16
+        log("info", "applying w8a16 weight-only quantization")
+        quantize_model_w8a16(lm)
     log("info", "moshi loaded")
 
     # 4) Construct LMGen like server.py's ServerState does
@@ -221,15 +257,20 @@ def run_inference(
         temp_text=temp_text,
         top_k=topk_audio,
         top_k_text=topk_text,
+        depformer_early_exit=dep_q_exit,
     )
     # Keep models in streaming mode similar to the server
     mimi.streaming_forever(1)
-    other_mimi.streaming_forever(1)
+    if other_mimi is not None:
+        other_mimi.streaming_forever(1)
     lm_gen.streaming_forever(1)
 
     # 5) Warmup
     log("info", "warming up the model")
     warmup(mimi, other_mimi, lm_gen, device, frame_size)
+    if fp8:
+        from .fp8_quantize import free_bf16_inproj
+        free_bf16_inproj(lm)
 
     # 6) Prompt configuration (text + voice)
     # System text tokens (k=0) and agent voice-prompt audio (k=1..dep_q) are forced
@@ -248,7 +289,8 @@ def run_inference(
     #    - Text prompt injection
     #    - Final audio silence
     mimi.reset_streaming()
-    other_mimi.reset_streaming()
+    if other_mimi is not None:
+        other_mimi.reset_streaming()
     lm_gen.reset_streaming()
     lm_gen.step_system_prompts(mimi)
     # Reset mimi streaming after voice prompt encoding
@@ -381,8 +423,56 @@ def main():
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
     parser.add_argument("--seed", type=int, default=-1, help="Seed for reproducibility (-1 disables)")
+    parser.add_argument("--fp8", action="store_true",
+                        help="Quantize LM linears to FP8 (torch._scaled_mm; requires SM >= 89)")
+    parser.add_argument("--w8a16", action="store_true",
+                        help="Weight-only 8-bit LM quantization, bf16 compute (Triton GEMV); exclusive with --fp8")
+    parser.add_argument("--fast", action="store_true",
+                        help="Preset: --w8a16 --dep-q-exit 8 --skip-other-mimi --mimi-fp16")
+    parser.add_argument("--skip-other-mimi", action="store_true",
+                        help="Skip the second mimi stream (its outputs are discarded in this path)")
+    parser.add_argument("--mimi-fp16", action="store_true",
+                        help="Run mimi in fp16 with its torch.compile path enabled")
+    parser.add_argument("--dep-q-exit", type=int, default=0,
+                        help="Stop the depformer after N steps (>=8). Safe in the serve flow "
+                             "because user-side codebooks are always provided.")
 
     args = parser.parse_args()
+    if args.mimi_fp16:
+        import importlib.util
+        if importlib.util.find_spec("triton") is None:
+            raise RuntimeError(
+                "--mimi-fp16 uses torch.compile on CUDA, which requires "
+                "Triton; install it with `pip install triton`.")
+    if args.fast:
+        import importlib.util
+        missing = []
+        if not torch.cuda.is_available():
+            missing.append("a CUDA device (required by --w8a16/--mimi-fp16)")
+        if importlib.util.find_spec("triton") is None:
+            missing.append("Triton (required by --w8a16's dequant GEMV and "
+                           "--mimi-fp16's torch.compile path)")
+        if missing:
+            raise RuntimeError(
+                "--fast cannot meet its performance contract; missing: "
+                + "; ".join(missing) + ". No silent degradation is "
+                "provided — run without --fast or install the prerequisite.")
+        args.w8a16 = True
+        args.dep_q_exit = args.dep_q_exit or 8
+        args.skip_other_mimi = True
+        args.mimi_fp16 = True
+    if args.fp8 and args.w8a16:
+        parser.error("--fp8 and --w8a16 are mutually exclusive")
+
+    # GB10 discoverability hint: log-only, fires only when NO perf flag is
+    # active and only on sm_121-class devices; never changes behavior.
+    _perf_flags = (args.fast or args.fp8 or args.w8a16 or args.mimi_fp16
+                   or args.skip_other_mimi or args.dep_q_exit > 0)
+    if (not _perf_flags and torch.cuda.is_available()
+            and torch.cuda.get_device_capability() == (12, 1)):
+        log("info", "GB10-class device detected (sm_121): real-time "
+                    "performance requires opt-in flags; try --fast "
+                    "(see PR notes)")
 
     # If --voice-prompt-dir is omitted, voices.tgz is downloaded from HF and extracted.
     voice_prompt_dir = _get_voice_prompt_dir(
@@ -424,6 +514,11 @@ def main():
             greedy=greedy,
             save_voice_prompt_embeddings=False,
             cpu_offload=args.cpu_offload,
+            dep_q_exit=args.dep_q_exit if args.dep_q_exit > 0 else None,
+            skip_other_mimi=args.skip_other_mimi,
+            mimi_fp16=args.mimi_fp16,
+            fp8=args.fp8,
+            w8a16=args.w8a16,
         )
 
 

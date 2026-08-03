@@ -176,6 +176,8 @@ def encode_from_sphn(mimi, samples, max_batch=sys.maxsize):
             break
 
         batch = torch.cat(current_batch, dim=0)  # shape: (B, C, T)
+        model_dtype = next(mimi.parameters()).dtype
+        batch = batch.to(dtype=model_dtype)
         encoded = mimi.encode(batch)  # shape: (B, K, F)
         separated = torch.unbind(encoded, dim=0)  # shape: (K, F)
         reshaped = [x.unsqueeze(0) for x in separated]  # shape: (1, K, F)
@@ -661,6 +663,7 @@ class LMGen(StreamingModule[_LMGenState]):
         save_voice_prompt_embeddings: bool = False,
         sample_rate: int = 32000,
         frame_rate: int = FRAME_RATE_HZ,
+        depformer_early_exit: Optional[int] = None,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -693,6 +696,20 @@ class LMGen(StreamingModule[_LMGenState]):
         self.delays_cuda = torch.tensor(
             lm_model.delays, device=lm_model.device, dtype=torch.long
         )
+        self.depformer_early_exit = depformer_early_exit
+        if depformer_early_exit is not None:
+            # The serve stack decodes agent audio from codebooks 1..8, so at
+            # least 8 depformer steps must run. Codebooks beyond the exit
+            # point are only skippable because every step of the serve flow
+            # (warmup, voice/text prompts, streaming) provides the user-side
+            # tokens, which overwrite the sampled values in the cache.
+            assert 8 <= depformer_early_exit <= lm_model.dep_q, (
+                f"depformer_early_exit must be in [8, {lm_model.dep_q}]"
+            )
+            assert not return_logits and not report_loss, (
+                "depformer_early_exit is incompatible with "
+                "return_logits/report_loss"
+            )
         self.save_voice_prompt_embeddings = save_voice_prompt_embeddings
         self.voice_prompt_audio: Optional[torch.Tensor] = None
         self.voice_prompt_cache: Optional[torch.Tensor] = None
@@ -817,6 +834,12 @@ class LMGen(StreamingModule[_LMGenState]):
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         state = self._streaming_state
         lm_model = self.lm_model
+        if self.depformer_early_exit is not None and input_tokens is None:
+            raise RuntimeError(
+                "depformer_early_exit requires input_tokens (user audio codes) "
+                "to be provided on every step: the skipped codebooks are only "
+                "safe to omit when provided tokens overwrite them."
+            )
         prepared_inputs = self.prepare_step_input(
             input_tokens, moshi_tokens, text_token,
         )
@@ -1139,8 +1162,11 @@ class LMGen(StreamingModule[_LMGenState]):
         depformer_tokens: list[torch.Tensor] = []
         depformer_logits: list[torch.Tensor] = []
         assert not lm_model.depformer.is_streaming
+        n_steps = lm_model.dep_q
+        if self.depformer_early_exit is not None:
+            n_steps = min(self.depformer_early_exit, lm_model.dep_q)
         with lm_model.depformer.streaming(B):
-            for cb_index in range(lm_model.dep_q):
+            for cb_index in range(n_steps):
                 input_ = prev_token[:, None, None]
                 logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
                 if self.return_logits:
@@ -1163,6 +1189,14 @@ class LMGen(StreamingModule[_LMGenState]):
                 )
                 depformer_tokens.append(next_token)
 
+        if len(depformer_tokens) < lm_model.dep_q:
+            # Early exit: pad the skipped codebooks with zero_token_id (-1,
+            # "no input"). These values never reach the cache in the serve
+            # flow because the corresponding channels are always provided.
+            pad = torch.full_like(depformer_tokens[0], lm_model.zero_token_id)
+            depformer_tokens.extend(
+                [pad] * (lm_model.dep_q - len(depformer_tokens))
+            )
         assert len(depformer_tokens) == lm_model.dep_q, (
             len(depformer_tokens),
             lm_model.dep_q,
