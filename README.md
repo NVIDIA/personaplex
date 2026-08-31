@@ -63,6 +63,14 @@ Access the Web UI from a browser at `localhost:8998` if running locally, otherwi
 Access the Web UI directly at https://11.54.401.33:8998
 ```
 
+### Asynchronous Memory Installation (Experimental)
+
+This branch also provides `moshi-seamless-server`, a persistent WebDemo
+gateway that alternates between two resident PersonaPlex GPUs while a third GPU
+runs streaming ASR and compaction. See
+[`docs/seamless_install.md`](docs/seamless_install.md) for the architecture,
+memory-worker contract, correctness invariants, and launch commands.
+
 ### Offline Evaluation
 
 For offline evaluation use the offline script that streams in an input wav file and produces an output wav file from the captured output stream. The output file will be the same duration as the input file.

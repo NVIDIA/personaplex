@@ -179,6 +179,7 @@ laurent/cuda-test/check
 client/node_modules
 timings.json
 mlx-trace.json
+/artifacts/
 
 # Include everything in assets
 !assets/
