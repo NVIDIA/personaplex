@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-01",
+  "scope": "PersonaPlex asynchronous memory-install system latency",
+  "production_gateway": {
+    "slurm_job": 1369867,
+    "hardware": ["NVIDIA A40", "NVIDIA A40"],
+    "input_audio": "assets/test/input_service.wav",
+    "frame_rate_hz": 12.5,
+    "frame_deadline_ms": 80.0,
+    "cold_model_process_startup_s": 26.2244,
+    "cold_session_start_s": 3.7005,
+    "active_baseline_ms": {
+      "mean": 65.1841,
+      "p50": 64.3695,
+      "p95": 67.6928,
+      "p99": 69.5955,
+      "max": 69.9072,
+      "deadline_miss_rate": 0.0,
+      "frames": 48
+    },
+    "active_during_install_ms": {
+      "mean": 65.1906,
+      "p50": 64.4297,
+      "p95": 67.7464,
+      "p99": 69.8182,
+      "max": 112.8556,
+      "deadline_miss_rate": 0.0025,
+      "frames": 400
+    },
+    "manual_install": {
+      "completed": true,
+      "prefill_s": 6.7493,
+      "bulk_replay_s": 25.1603,
+      "critical_section_s": 0.0633,
+      "step_lock_wait_s": 0.0115,
+      "trigger_to_swap_s": 31.9845,
+      "frames_replayed_after_cutoff": 400,
+      "effective_replay_frames_per_s": 15.8981,
+      "effective_replay_rtf": 0.7863,
+      "codec_match_run_at_ready": 26,
+      "decoder_match_run_at_ready": 242
+    }
+  },
+  "process_isolation_ablation": {
+    "slurm_job": 1369866,
+    "hardware": ["NVIDIA A40", "NVIDIA A40"],
+    "active_baseline_p95_ms": 65.5527,
+    "active_during_shadow_replay_p95_ms": 65.2755,
+    "active_deadline_miss_rate": 0.0,
+    "shadow_replay_rtf": 0.7864,
+    "user_code_mismatches": 0,
+    "target_mismatches": 0,
+    "decoder_mismatches": 0
+  },
+  "threaded_runtime_ablation": {
+    "slurm_job": 1369815,
+    "hardware": ["NVIDIA A40", "NVIDIA A40"],
+    "active_baseline_p95_ms": 63.9974,
+    "active_during_shadow_replay_p95_ms": 85.3675,
+    "active_during_shadow_replay_p99_ms": 119.4243,
+    "active_deadline_miss_rate": 0.0898,
+    "controller_completed_within_30_s": false,
+    "note": "A shared process caused CUDA-graph/device-context interference and is retained only as an ablation."
+  },
+  "memory_transport_loopback": {
+    "session_start_ms": 2.1278,
+    "largest_burst_events": 614,
+    "largest_burst_enqueue_p99_ms": 0.0152,
+    "largest_burst_drain_s": 0.1518,
+    "largest_burst_events_per_s": 4044.0,
+    "note": "Transport and a no-op compact endpoint only; this is not compactor generation time."
+  },
+  "gpu1_prior_actual_artifacts": {
+    "conditions": 24,
+    "compactor_generation_s": {
+      "mean": 6.3248,
+      "p50": 6.3845,
+      "p95": 6.7433,
+      "max": 7.158
+    },
+    "asr_cold_model_load_s": {
+      "mean": 11.1536,
+      "p50": 9.3457,
+      "p95": 21.0031,
+      "max": 21.5502
+    },
+    "offline_asr_decode_s": {
+      "mean": 4.0996,
+      "p50": 4.1038,
+      "p95": 6.031,
+      "max": 6.2453
+    },
+    "note": "ASR load is service startup. Offline clip decode is not added to recurring latency when streaming ASR is already caught up."
+  },
+  "derived_current_pipeline": {
+    "equation": "T=(C+P)*R/(R-f)",
+    "live_frame_rate_fps": 12.5,
+    "effective_replay_rate_fps": 15.8981,
+    "prefill_s": 6.7493,
+    "using_mean_compaction": {
+      "estimated_trigger_to_ready_s": 61.1682,
+      "reserve_frames": 764.6
+    },
+    "using_p95_compaction": {
+      "estimated_trigger_to_ready_s": 63.1262,
+      "reserve_frames": 789.1
+    },
+    "provisional_engineering_reserve_frames": 900
+  },
+  "measurement_cost": {
+    "openai_api_usd": 0.0,
+    "allocated_gpu_hours_including_failed_diagnostics": 0.6111,
+    "note": "Internal Slurm allocation time; not a cloud billing estimate."
+  }
+}

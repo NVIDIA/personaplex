@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import deque
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import random
 import tarfile
 import time
+from typing import Any
 import uuid
 
 import aiohttp
@@ -23,7 +25,11 @@ import torch
 from .models import loaders
 from .seamless.controller import SeamlessInstallController
 from .seamless.memory import HttpMemoryWorker, NullMemoryWorker
-from .seamless.model_slot import AsyncPersonaPlexSlot, PersonaPlexSlotEngine
+from .seamless.model_slot import (
+    AsyncPersonaPlexSlot,
+    PersonaPlexSlotEngine,
+    ProcessPersonaPlexSlot,
+)
 from .seamless.types import ControllerConfig
 from .utils.connection import create_ssl_context, get_lan_ip
 
@@ -31,9 +37,11 @@ from .utils.connection import create_ssl_context, get_lan_ip
 logger = logging.getLogger(__name__)
 
 
-def seed_all(seed: int) -> None:
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
+def seed_all(seed: int, *, include_cuda: bool = True) -> None:
+    # ``torch.manual_seed`` also touches CUDA generators. Keep the gateway
+    # process CUDA-free when models are isolated in children.
+    torch.random.default_generator.manual_seed(seed)
+    if include_cuda and torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -75,7 +83,7 @@ class SeamlessWebState:
     def __init__(
         self,
         *,
-        slots: tuple[AsyncPersonaPlexSlot, AsyncPersonaPlexSlot],
+        slots: tuple[Any, Any],
         controller: SeamlessInstallController,
         voice_prompt_dir: str,
         sample_rate: int,
@@ -89,6 +97,8 @@ class SeamlessWebState:
         self.frame_size = frame_size
         self.control_token = control_token
         self.connection_lock = asyncio.Lock()
+        self.frame_latencies_ms: deque[float] = deque(maxlen=20_000)
+        self.session_started_at: float | None = None
 
     async def handle_chat(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
@@ -111,11 +121,14 @@ class SeamlessWebState:
 
         async with self.connection_lock:
             if seed >= 0:
-                seed_all(seed)
+                seed_all(seed, include_cuda=False)
+                await asyncio.gather(*(slot.set_seed(seed) for slot in self.slots))
             close = False
             opus_writer = sphn.OpusStreamWriter(self.sample_rate)
             opus_reader = sphn.OpusStreamReader(self.sample_rate)
             try:
+                self.frame_latencies_ms.clear()
+                self.session_started_at = time.time()
                 await self.controller.start_session(
                     session_id=session_id,
                     role_prompt=role_prompt,
@@ -176,6 +189,7 @@ class SeamlessWebState:
                                     b"\x02" + result.output_text.encode("utf-8")
                                 )
                             elapsed = time.monotonic() - started
+                            self.frame_latencies_ms.append(elapsed * 1000)
                             frame_seconds = self.frame_size / self.sample_rate
                             if elapsed > frame_seconds:
                                 logger.warning(
@@ -227,7 +241,26 @@ class SeamlessWebState:
 
     async def handle_status(self, request: web.Request) -> web.Response:
         del request
-        return web.json_response(self.controller.status())
+        status = self.controller.status()
+        values = np.asarray(self.frame_latencies_ms, dtype=np.float64)
+        frame_budget_ms = self.frame_size / self.sample_rate * 1000
+        status["active_latency"] = {
+            "frames": int(values.size),
+            "frame_budget_ms": frame_budget_ms,
+            "p50_ms": float(np.percentile(values, 50)) if values.size else None,
+            "p95_ms": float(np.percentile(values, 95)) if values.size else None,
+            "p99_ms": float(np.percentile(values, 99)) if values.size else None,
+            "max_ms": float(values.max()) if values.size else None,
+            "deadline_miss_rate": (
+                float(np.mean(values > frame_budget_ms)) if values.size else None
+            ),
+            "session_wall_s": (
+                time.time() - self.session_started_at
+                if self.session_started_at is not None
+                else None
+            ),
+        }
+        return web.json_response(status)
 
     async def handle_install(self, request: web.Request) -> web.Response:
         self._authorize_control(request)
@@ -300,6 +333,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--voice-prompt-dir")
     parser.add_argument("--active-device", default="cuda:1")
     parser.add_argument("--shadow-device", default="cuda:2")
+    parser.add_argument(
+        "--slot-runtime",
+        choices=("process", "thread"),
+        default="process",
+        help="isolate each CUDA context in a process (production default)",
+    )
     parser.add_argument("--cpu-offload", action="store_true")
     parser.add_argument("--memory-worker-url")
     parser.add_argument(
@@ -335,7 +374,7 @@ def main() -> None:
     args = _build_parser().parse_args()
     if args.active_device == args.shadow_device:
         raise ValueError("active-device and shadow-device must be different")
-    seed_all(42424242)
+    seed_all(42424242, include_cuda=args.slot_runtime == "thread")
 
     voice_prompt_dir = _get_voice_prompt_dir(args.voice_prompt_dir, args.hf_repo)
     static_path = _get_static_path(args.static)
@@ -348,28 +387,60 @@ def main() -> None:
         args.hf_repo, loaders.TEXT_TOKENIZER_NAME
     )
 
-    engines = []
-    for name, device in (
-        ("slot-a", args.active_device),
-        ("slot-b", args.shadow_device),
-    ):
-        logger.info("loading resident %s on %s", name, device)
-        engines.append(
-            PersonaPlexSlotEngine(
-                name=name,
-                device=device,
-                mimi_weight=mimi_weight,
-                moshi_weight=moshi_weight,
-                tokenizer_path=tokenizer,
-                cpu_offload=args.cpu_offload,
-                decoder_mse_threshold=args.decoder_mse_threshold,
-            )
-        )
-    slots = (AsyncPersonaPlexSlot(engines[0]), AsyncPersonaPlexSlot(engines[1]))
-
     async def make_app() -> web.Application:
-        logger.info("warming both resident slots")
-        await asyncio.gather(*(slot.warmup() for slot in slots))
+        slot_specs = (
+            ("slot-a", args.active_device),
+            ("slot-b", args.shadow_device),
+        )
+        if args.slot_runtime == "process":
+            slots = tuple(
+                ProcessPersonaPlexSlot(
+                    name=name,
+                    device=device,
+                    mimi_weight=mimi_weight,
+                    moshi_weight=moshi_weight,
+                    tokenizer_path=tokenizer,
+                    cpu_offload=args.cpu_offload,
+                    decoder_mse_threshold=args.decoder_mse_threshold,
+                    process_rank=process_rank,
+                    process_world_size=len(slot_specs),
+                )
+                for process_rank, (name, device) in enumerate(slot_specs)
+            )
+            logger.info("loading and warming isolated resident processes")
+            try:
+                await asyncio.gather(*(slot.warmup() for slot in slots))
+            except BaseException:
+                for slot in slots:
+                    slot.close()
+                raise
+            sample_rate = slots[0].sample_rate
+            frame_size = slots[0].frame_size
+        else:
+            engines = []
+            for name, device in slot_specs:
+                logger.info("loading threaded resident %s on %s", name, device)
+                engines.append(
+                    PersonaPlexSlotEngine(
+                        name=name,
+                        device=device,
+                        mimi_weight=mimi_weight,
+                        moshi_weight=moshi_weight,
+                        tokenizer_path=tokenizer,
+                        cpu_offload=args.cpu_offload,
+                        decoder_mse_threshold=args.decoder_mse_threshold,
+                    )
+                )
+            slots = (
+                AsyncPersonaPlexSlot(engines[0]),
+                AsyncPersonaPlexSlot(engines[1]),
+            )
+            # CUDA graph capture is process-global, so threaded startup must
+            # serialize first capture even though the devices differ.
+            for slot in slots:
+                await slot.warmup()
+            sample_rate = engines[0].mimi.sample_rate
+            frame_size = engines[0].frame_size
         memory_worker = (
             HttpMemoryWorker(
                 args.memory_worker_url,
@@ -397,8 +468,8 @@ def main() -> None:
             slots=slots,
             controller=controller,
             voice_prompt_dir=voice_prompt_dir,
-            sample_rate=engines[0].mimi.sample_rate,
-            frame_size=engines[0].frame_size,
+            sample_rate=sample_rate,
+            frame_size=frame_size,
             control_token=args.control_token,
         )
         app = web.Application()

@@ -122,6 +122,8 @@ class ReplayResult:
     frames: int
     user_code_mismatches: int
     target_mismatches: int
+    user_code_values_differ: int = 0
+    user_codebook_mismatches: tuple[int, ...] = ()
     last_user_mismatch_seq: int | None = None
     decoder_frames_compared: int = 0
     decoder_mismatches: int = 0
@@ -159,3 +161,4 @@ class SwapRecord:
     forced_boundary: bool
     memory: str
     request_id: str
+    timings: dict[str, float] = field(default_factory=dict)

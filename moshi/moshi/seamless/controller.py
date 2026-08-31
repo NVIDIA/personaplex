@@ -122,7 +122,14 @@ class SeamlessInstallController:
         try:
             await self.memory_worker.start_session(session_id, self._role_prompt)
             memory_started = True
-            await self.active_slot.start_session(self._role_prompt, voice_prompt)
+            # Prime both resident processes with the role and voice. The
+            # shadow will be reset with memory at install time, but its voice
+            # embedding is then cached and does not inflate first-handoff
+            # latency by several seconds.
+            await asyncio.gather(
+                self.active_slot.start_session(self._role_prompt, voice_prompt),
+                self.shadow_slot.start_session(self._role_prompt, voice_prompt),
+            )
         except Exception:
             if memory_started:
                 await self.memory_worker.close_session(session_id)
@@ -279,6 +286,7 @@ class SeamlessInstallController:
                 "replayed_through_seq": self._last_swap.replayed_through_seq,
                 "forced_boundary": self._last_swap.forced_boundary,
                 "request_id": self._last_swap.request_id,
+                "timings": self._last_swap.timings,
             }
         return {
             "phase": self.phase.value,
@@ -358,10 +366,18 @@ class SeamlessInstallController:
         memory_override: str | None,
         reason: str,
     ) -> None:
+        install_started = time.perf_counter()
+        compact_started = time.perf_counter()
         compact = await self._obtain_compaction(
             request_id=request_id,
             cutoff_hint=cutoff_hint,
             memory_override=memory_override,
+        )
+        compact_wall_s = time.perf_counter() - compact_started
+        await self._emit(
+            "compaction_finished",
+            request_id=request_id,
+            wall_s=compact_wall_s,
         )
         self._validate_compaction(compact, request_id, cutoff_hint)
         self._require_generation(generation)
@@ -374,9 +390,16 @@ class SeamlessInstallController:
             cutoff_seq=compact.cutoff_seq,
         )
         shadow = self.shadow_slot
+        prefill_started = time.perf_counter()
         await shadow.start_session(
             self._compose_installed_prompt(compact.memory),
             self._voice_prompt,
+        )
+        prefill_wall_s = time.perf_counter() - prefill_started
+        await self._emit(
+            "install_prefill_finished",
+            request_id=request_id,
+            wall_s=prefill_wall_s,
         )
         self._require_generation(generation)
 
@@ -384,9 +407,11 @@ class SeamlessInstallController:
         replayed_through = compact.cutoff_seq
         codec_match_run = 0
         decoder_match_run = 0
+        bulk_replay_wall_s = 0.0
         ready_at: float | None = None
         while True:
             self._require_generation(generation)
+            replay_started = time.perf_counter()
             (
                 replayed_through,
                 codec_match_run,
@@ -398,6 +423,7 @@ class SeamlessInstallController:
                 decoder_match_run,
                 request_id,
             )
+            bulk_replay_wall_s += time.perf_counter() - replay_started
             lag = self.ledger.latest_seq - replayed_through
             codec_ready = codec_match_run >= self.config.codec_convergence_frames
             decoder_ready = decoder_match_run >= self.config.decoder_convergence_frames
@@ -407,7 +433,7 @@ class SeamlessInstallController:
                 and decoder_ready
             ):
                 if ready_at is None:
-                    ready_at = time.monotonic()
+                    ready_at = time.perf_counter()
                     self.phase = ControllerPhase.READY
                     await self._emit(
                         "install_ready",
@@ -421,7 +447,7 @@ class SeamlessInstallController:
                     self.config.silence_rms_threshold,
                 )
                 forced_boundary = (
-                    time.monotonic() - ready_at >= self.config.force_switch_after_s
+                    time.perf_counter() - ready_at >= self.config.force_switch_after_s
                 )
                 if safe or forced_boundary:
                     await self._atomic_catchup_and_swap(
@@ -433,6 +459,11 @@ class SeamlessInstallController:
                         compact=compact,
                         forced_boundary=forced_boundary,
                         reason=reason,
+                        install_started=install_started,
+                        compact_wall_s=compact_wall_s,
+                        prefill_wall_s=prefill_wall_s,
+                        bulk_replay_wall_s=bulk_replay_wall_s,
+                        ready_at=ready_at,
                     )
                     return
             await self._wait_for_next_frame_or_boundary_timer(ready_at)
@@ -532,14 +563,26 @@ class SeamlessInstallController:
         compact: CompactResult,
         forced_boundary: bool,
         reason: str,
+        install_started: float,
+        compact_wall_s: float,
+        prefill_wall_s: float,
+        bulk_replay_wall_s: float,
+        ready_at: float | None,
     ) -> int:
+        lock_requested = time.perf_counter()
+        final_replay_frames = 0
+        final_replay_wall_s = 0.0
         async with self._step_lock:
+            lock_acquired = time.perf_counter()
             self._require_generation(generation)
             latest = self.ledger.latest_seq
             if replayed_through < latest:
+                final_replay_frames = latest - replayed_through
+                final_replay_started = time.perf_counter()
                 replay = await shadow.replay(
                     self.ledger.slice(replayed_through + 1, latest + 1)
                 )
+                final_replay_wall_s = time.perf_counter() - final_replay_started
                 self._require_exact_target_replay(replay)
                 codec_match_run = self._updated_codec_match_run(codec_match_run, replay)
                 decoder_match_run = self._updated_decoder_match_run(
@@ -565,6 +608,20 @@ class SeamlessInstallController:
             self._memory = compact.memory.strip()
             self._last_cutoff_seq = compact.cutoff_seq
             self._last_error = None
+            swapped_at = time.perf_counter()
+            timings = {
+                "trigger_to_swap_s": swapped_at - install_started,
+                "compaction_s": compact_wall_s,
+                "prefill_s": prefill_wall_s,
+                "bulk_replay_s": bulk_replay_wall_s,
+                "safe_boundary_wait_s": (
+                    0.0 if ready_at is None else max(0.0, lock_requested - ready_at)
+                ),
+                "step_lock_wait_s": lock_acquired - lock_requested,
+                "final_replay_s": final_replay_wall_s,
+                "critical_section_s": swapped_at - lock_acquired,
+                "final_replay_frames": float(final_replay_frames),
+            }
             self._last_swap = SwapRecord(
                 version=self._memory_version,
                 old_active=old_active,
@@ -574,6 +631,7 @@ class SeamlessInstallController:
                 forced_boundary=forced_boundary,
                 memory=self._memory,
                 request_id=compact.request_id,
+                timings=timings,
             )
             self.phase = ControllerPhase.ACTIVE
         await self._emit(
@@ -586,6 +644,7 @@ class SeamlessInstallController:
             cutoff_seq=compact.cutoff_seq,
             replayed_through_seq=replayed_through,
             forced_boundary=forced_boundary,
+            timings=timings,
         )
         return replayed_through
 
@@ -595,7 +654,9 @@ class SeamlessInstallController:
         self._frame_advanced.clear()
         timeout = 0.1
         if ready_at is not None:
-            remaining = self.config.force_switch_after_s - (time.monotonic() - ready_at)
+            remaining = self.config.force_switch_after_s - (
+                time.perf_counter() - ready_at
+            )
             timeout = max(0.001, min(timeout, remaining))
         try:
             await asyncio.wait_for(self._frame_advanced.wait(), timeout=timeout)

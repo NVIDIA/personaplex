@@ -9,7 +9,10 @@ browser WebSocket ──> persistent gateway ──> slot A / GPU 2 (active)
                             └── PCM ───────> ASR + compactor / GPU 1
 ```
 
-The two PersonaPlex checkpoints are loaded once and remain resident. A compact
+The two PersonaPlex checkpoints are loaded once and remain resident in separate
+OS processes. Process isolation is required because a shared Python/CUDA
+process caused CUDA-graph interference and active-stream deadline misses in the
+two-GPU benchmark. A compact
 trigger never unloads or blocks the active checkpoint. GPU 1 builds a cumulative
 memory at an exact committed frame cutoff; the inactive PersonaPlex receives
 that memory as a new system prefix, replays the post-cutoff duplex tail, catches
@@ -146,6 +149,9 @@ moshi-seamless-server \
   --control-token "$SEAMLESS_CONTROL_TOKEN"
 ```
 
+`--slot-runtime process` is the default. `--slot-runtime thread` exists only as
+a diagnostic ablation and should not be used for a seamless-latency claim.
+
 The standard PersonaPlex WebDemo still connects to `/api/chat`. Runtime state
 is visible at:
 
@@ -196,3 +202,17 @@ actual GPU-1 ASR/compactor service. Report at least active-frame p50/p95/p99,
 shadow replay RTF, catch-up lag, switch pause, audio discontinuity, exact target
 replay mismatches, Mimi convergence length, memory correctness, and unchanged
 full-duplex behavior before treating the installation as seamless.
+
+The current A40 measurements, catch-up equation, provisional trigger reserve,
+and known bottlenecks are documented in
+[`seamless_latency_analysis.md`](seamless_latency_analysis.md). Reproduce the
+system-level measurements with:
+
+```bash
+PYTHONPATH=moshi python moshi/tests/gpu_process_isolation_benchmark.py \
+  --output process-isolation.json
+PYTHONPATH=moshi python moshi/tests/gpu_process_gateway_benchmark.py \
+  --output process-gateway.json
+PYTHONPATH=moshi python moshi/tests/http_memory_latency_benchmark.py \
+  --output memory-transport.json
+```

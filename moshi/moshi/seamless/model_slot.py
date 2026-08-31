@@ -5,6 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+import multiprocessing as mp
+import os
+from pathlib import Path
+import random
+import traceback
 from typing import Any
 
 import numpy as np
@@ -66,6 +71,13 @@ class PersonaPlexSlotEngine:
     @property
     def max_delay(self) -> int:
         return int(self.lm_gen.max_delay)
+
+    def set_seed(self, seed: int) -> None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed(seed)
 
     @torch.no_grad()
     def warmup(self) -> None:
@@ -159,6 +171,8 @@ class PersonaPlexSlotEngine:
         if not frames:
             raise ValueError("cannot replay an empty batch")
         user_mismatches = 0
+        user_code_values_differ = 0
+        user_codebook_mismatches = np.zeros(8, dtype=np.int64)
         target_mismatches = 0
         last_user_mismatch_seq: int | None = None
         decoder_frames_compared = 0
@@ -172,8 +186,11 @@ class PersonaPlexSlotEngine:
             user = self.mimi.encode(chunk)
             _ = self.other_mimi.encode(chunk)
             observed_user = user[0, :, 0].detach().to("cpu", dtype=torch.long).numpy()
-            if not np.array_equal(observed_user, frame.user_codes):
+            differing_codes = observed_user != frame.user_codes
+            if bool(np.any(differing_codes)):
                 user_mismatches += 1
+                user_code_values_differ += int(np.sum(differing_codes))
+                user_codebook_mismatches += differing_codes.astype(np.int64)
                 last_user_mismatch_seq = frame.seq
 
             # A public ``moshi_tokens=...`` call applies per-codebook delays,
@@ -222,6 +239,10 @@ class PersonaPlexSlotEngine:
             frames=len(frames),
             user_code_mismatches=user_mismatches,
             target_mismatches=target_mismatches,
+            user_code_values_differ=user_code_values_differ,
+            user_codebook_mismatches=tuple(
+                int(value) for value in user_codebook_mismatches
+            ),
             last_user_mismatch_seq=last_user_mismatch_seq,
             decoder_frames_compared=decoder_frames_compared,
             decoder_mismatches=decoder_mismatches,
@@ -282,6 +303,9 @@ class AsyncPersonaPlexSlot:
     async def warmup(self) -> None:
         await self._call(self.engine.warmup)
 
+    async def set_seed(self, seed: int) -> None:
+        await self._call(self.engine.set_seed, seed)
+
     async def start_session(self, prompt: str, voice_prompt: str) -> None:
         await self._call(self.engine.start_session, prompt, voice_prompt)
 
@@ -299,4 +323,245 @@ class AsyncPersonaPlexSlot:
 
     async def _call(self, function: Any, *args: Any) -> Any:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, function, *args)
+        return await loop.run_in_executor(
+            self._executor, self._call_on_device, function, *args
+        )
+
+    def _call_on_device(self, function: Any, *args: Any) -> Any:
+        # CUDA's current device is thread-local. Each resident slot owns a
+        # worker thread, so explicitly bind that thread before graph capture
+        # and every subsequent model invocation.
+        if self.engine.device.type == "cuda":
+            with torch.cuda.device(self.engine.device):
+                return function(*args)
+        return function(*args)
+
+
+def _process_slot_main(
+    connection: Any,
+    config: dict[str, Any],
+) -> None:
+    """Own one CUDA context and PersonaPlex instance in a child process."""
+
+    try:
+        allowed = sorted(os.sched_getaffinity(0))
+        process_rank = int(config.pop("process_rank"))
+        process_world_size = int(config.pop("process_world_size"))
+        assigned = partition_process_cpus(
+            allowed,
+            rank=process_rank,
+            world_size=process_world_size,
+        )
+        os.sched_setaffinity(0, assigned)
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+        device = torch.device(config["device"])
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        engine = PersonaPlexSlotEngine(**config)
+        engine.set_seed(42424242)
+        engine.warmup()
+        connection.send(
+            {
+                "kind": "ready",
+                "max_delay": engine.max_delay,
+                "sample_rate": engine.mimi.sample_rate,
+                "frame_size": engine.frame_size,
+                "device_name": (
+                    torch.cuda.get_device_name(device)
+                    if device.type == "cuda"
+                    else str(device)
+                ),
+                "cpus": assigned,
+            }
+        )
+        while True:
+            request_id, method, args = connection.recv()
+            if method == "close":
+                connection.send((request_id, True, None))
+                return
+            try:
+                result = getattr(engine, method)(*args)
+                connection.send((request_id, True, result))
+            except BaseException as exc:
+                connection.send(
+                    (
+                        request_id,
+                        False,
+                        {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                )
+    except BaseException as exc:
+        try:
+            connection.send(
+                {
+                    "kind": "startup_error",
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+        except BaseException:
+            pass
+        raise
+    finally:
+        connection.close()
+
+
+def partition_process_cpus(
+    allowed: list[int],
+    *,
+    rank: int,
+    world_size: int,
+) -> list[int]:
+    """Assign whole physical cores, including siblings, to one process."""
+
+    core_groups: dict[tuple[int, int], list[int]] = {}
+    try:
+        for cpu in allowed:
+            topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+            package = int((topology / "physical_package_id").read_text().strip())
+            core = int((topology / "core_id").read_text().strip())
+            core_groups.setdefault((package, core), []).append(cpu)
+    except (OSError, ValueError):
+        return allowed[rank::world_size] or allowed
+    assigned_groups = [
+        cpus
+        for index, (_, cpus) in enumerate(sorted(core_groups.items()))
+        if index % world_size == rank
+    ]
+    assigned = sorted(cpu for group in assigned_groups for cpu in group)
+    return assigned or allowed
+
+
+class ProcessPersonaPlexSlot:
+    """Async RPC proxy to a PersonaPlex instance isolated in its own process."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        device: str,
+        mimi_weight: str,
+        moshi_weight: str,
+        tokenizer_path: str,
+        cpu_offload: bool = False,
+        decoder_mse_threshold: float = 1e-7,
+        process_rank: int = 0,
+        process_world_size: int = 1,
+    ) -> None:
+        self.name = name
+        self.device = torch.device(device)
+        self.max_delay = 0
+        self.sample_rate = 0
+        self.frame_size = 0
+        self.device_name = ""
+        self.assigned_cpus: list[int] = []
+        self._request_id = 0
+        self._closed = False
+        self._ready = False
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"personaplex-rpc-{name}",
+        )
+        context = mp.get_context("spawn")
+        self._connection, child_connection = context.Pipe(duplex=True)
+        config = {
+            "name": name,
+            "device": device,
+            "mimi_weight": mimi_weight,
+            "moshi_weight": moshi_weight,
+            "tokenizer_path": tokenizer_path,
+            "cpu_offload": cpu_offload,
+            "decoder_mse_threshold": decoder_mse_threshold,
+            "process_rank": process_rank,
+            "process_world_size": process_world_size,
+        }
+        self._process = context.Process(
+            target=_process_slot_main,
+            args=(child_connection, config),
+            name=f"personaplex-{name}",
+        )
+        self._process.start()
+        child_connection.close()
+
+    async def warmup(self) -> None:
+        if self._ready:
+            return
+        loop = asyncio.get_running_loop()
+        message = await loop.run_in_executor(self._executor, self._connection.recv)
+        if message.get("kind") != "ready":
+            raise RuntimeError(
+                f"{self.name} failed to start: {message.get('type')}: "
+                f"{message.get('message')}\n{message.get('traceback', '')}"
+            )
+        self.max_delay = int(message["max_delay"])
+        self.sample_rate = int(message["sample_rate"])
+        self.frame_size = int(message["frame_size"])
+        self.device_name = str(message["device_name"])
+        self.assigned_cpus = [int(value) for value in message["cpus"]]
+        self._ready = True
+
+    async def set_seed(self, seed: int) -> None:
+        await self._rpc("set_seed", seed)
+
+    async def start_session(self, prompt: str, voice_prompt: str) -> None:
+        await self._rpc("start_session", prompt, voice_prompt)
+
+    async def active_step(self, seq: int, pcm: np.ndarray) -> StepResult:
+        return await self._rpc("active_step", seq, pcm)
+
+    async def replay(self, frames: list[DuplexFrame]) -> ReplayResult:
+        return await self._rpc("replay", frames)
+
+    async def context_frames(self) -> int:
+        return await self._rpc("context_frames")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._process.is_alive() and self._ready:
+                # Serialize shutdown behind any replay RPC whose asyncio
+                # waiter was cancelled; multiprocessing Pipe is not safe for
+                # two concurrent request/response exchanges.
+                self._executor.submit(self._rpc_sync, "close").result(timeout=30)
+        finally:
+            self._connection.close()
+            self._process.join(timeout=10)
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=5)
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+    async def _rpc(self, method: str, *args: Any) -> Any:
+        if not self._ready:
+            raise RuntimeError(f"{self.name} is not ready")
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self._rpc_sync,
+            method,
+            *args,
+        )
+
+    def _rpc_sync(self, method: str, *args: Any) -> Any:
+        self._request_id += 1
+        request_id = self._request_id
+        self._connection.send((request_id, method, args))
+        response_id, ok, payload = self._connection.recv()
+        if response_id != request_id:
+            raise RuntimeError(
+                f"{self.name}: RPC response {response_id} != request {request_id}"
+            )
+        if not ok:
+            raise RuntimeError(
+                f"{self.name}.{method} failed: {payload['type']}: "
+                f"{payload['message']}\n{payload['traceback']}"
+            )
+        return payload

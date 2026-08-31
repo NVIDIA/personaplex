@@ -137,6 +137,8 @@ class SeamlessControllerTests(unittest.IsolatedAsyncioTestCase):
         await controller.start_session(
             session_id="s1", role_prompt="Be helpful.", voice_prompt="voice.pt"
         )
+        self.assertEqual(len(active.prompts), 1)
+        self.assertEqual(len(shadow.prompts), 1)
 
         for _ in range(3):
             await controller.process_pcm(np.zeros(4, dtype=np.float32))
@@ -154,6 +156,8 @@ class SeamlessControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.active_slot.name, "gpu-3")
         self.assertIn(3, shadow.replayed_seqs)
         self.assertIn("conversation_memory", shadow.prompts[-1])
+        self.assertGreaterEqual(swap.timings["critical_section_s"], 0)
+        self.assertGreaterEqual(swap.timings["trigger_to_swap_s"], 0)
         await controller.close_session()
 
     async def test_manual_installs_ping_pong_between_resident_slots(self) -> None:
