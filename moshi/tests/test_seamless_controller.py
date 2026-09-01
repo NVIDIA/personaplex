@@ -31,8 +31,15 @@ class FakeSlot:
         self.prompts: list[str] = []
         self.active_seqs: list[int] = []
         self.replayed_seqs: list[int] = []
+        self.prefilled_seqs: list[int] = []
 
-    async def start_session(self, prompt: str, voice_prompt: str) -> None:
+    async def start_session(
+        self,
+        prompt: str,
+        voice_prompt: str,
+        text_prefill_chunk_size: int = 64,
+    ) -> None:
+        del text_prefill_chunk_size
         self.prompts.append(f"{voice_prompt}|{prompt}")
 
     async def active_step(self, seq: int, pcm: np.ndarray) -> StepResult:
@@ -58,6 +65,25 @@ class FakeSlot:
         if self.replay_delay:
             await asyncio.sleep(self.replay_delay)
         self.replayed_seqs.extend(frame.seq for frame in frames)
+        mismatches = [
+            frame.seq for frame in frames if frame.seq in self.codec_mismatch_seqs
+        ]
+        return ReplayResult(
+            start_seq=frames[0].seq,
+            end_seq=frames[-1].seq,
+            frames=len(frames),
+            user_code_mismatches=len(mismatches),
+            target_mismatches=0,
+            last_user_mismatch_seq=mismatches[-1] if mismatches else None,
+            decoder_frames_compared=len(frames),
+            decoder_mismatches=0,
+            last_decoder_compared_seq=frames[-1].seq,
+        )
+
+    async def prefill_duplex(self, frames: list[DuplexFrame]) -> ReplayResult:
+        if self.replay_delay:
+            await asyncio.sleep(self.replay_delay)
+        self.prefilled_seqs.extend(frame.seq for frame in frames)
         mismatches = [
             frame.seq for frame in frames if frame.seq in self.codec_mismatch_seqs
         ]
@@ -113,7 +139,8 @@ def test_config() -> ControllerConfig:
     return ControllerConfig(
         context_capacity_frames=8,
         trigger_reserve_frames=5,
-        replay_batch_frames=2,
+        prefill_batch_frames=2,
+        text_prefill_chunk_tokens=2,
         switch_max_lag_frames=0,
         safe_silence_frames=1,
         force_switch_after_s=0.05,
@@ -154,7 +181,8 @@ class SeamlessControllerTests(unittest.IsolatedAsyncioTestCase):
         swap = await controller.wait_for_install()
         self.assertIsNotNone(swap)
         self.assertEqual(controller.active_slot.name, "gpu-3")
-        self.assertIn(3, shadow.replayed_seqs)
+        self.assertIn(3, shadow.prefilled_seqs)
+        self.assertEqual(shadow.replayed_seqs, [])
         self.assertIn("conversation_memory", shadow.prompts[-1])
         self.assertGreaterEqual(swap.timings["critical_section_s"], 0)
         self.assertGreaterEqual(swap.timings["trigger_to_swap_s"], 0)

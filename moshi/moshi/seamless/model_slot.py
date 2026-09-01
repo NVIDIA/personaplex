@@ -98,7 +98,12 @@ class PersonaPlexSlotEngine:
         self.lm_gen.reset_streaming()
 
     @torch.no_grad()
-    def start_session(self, prompt: str, voice_prompt: str) -> None:
+    def start_session(
+        self,
+        prompt: str,
+        voice_prompt: str,
+        text_prefill_chunk_size: int = 64,
+    ) -> None:
         if self._voice_prompt != voice_prompt:
             if voice_prompt.endswith(".pt"):
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt)
@@ -111,7 +116,10 @@ class PersonaPlexSlotEngine:
         self.lm_gen.text_prompt_tokens = self.tokenizer.encode(
             wrap_with_system_tags(prompt)
         )
-        self.lm_gen.step_system_prompts(self.mimi)
+        self.lm_gen.step_system_prompts_prefill(
+            self.mimi,
+            text_chunk_size=text_prefill_chunk_size,
+        )
         # Match the official web server: conversation input starts with a clean
         # Mimi encoder while the LM retains its system/voice prefix state.
         self.mimi.reset_streaming()
@@ -163,6 +171,134 @@ class PersonaPlexSlotEngine:
             output_text=output_text,
             emitted_seq=emitted_seq,
             context_frames=self.context_frames(),
+        )
+
+    @torch.no_grad()
+    def prefill_duplex(self, frames: list[DuplexFrame]) -> ReplayResult:
+        """Prefill known duplex frames with a true time-dimension LM pass.
+
+        The active ledger already contains every user code and every
+        delay-corrected assistant target.  The main Transformer therefore
+        processes ``T=len(frames)`` positions together; Mimi processes the
+        corresponding PCM/codes as time chunks to reconstruct its streaming
+        boundary state.
+        """
+
+        self._require_started()
+        if not frames:
+            raise ValueError("cannot prefill an empty duplex batch")
+        for previous, current in zip(frames, frames[1:]):
+            if current.seq != previous.seq + 1:
+                raise ValueError(
+                    f"duplex prefill must be contiguous: {previous.seq}, {current.seq}"
+                )
+        for frame in frames:
+            self._replay_frames[frame.seq] = frame
+
+        # Mimi's production CUDA graphs are captured at one codec frame. Keep
+        # causal codec-state restoration graph-safe while batching the much
+        # more expensive 7B Transformer over the full time dimension below.
+        observed_frames: list[torch.Tensor] = []
+        for frame in frames:
+            pcm_tensor = torch.from_numpy(frame.pcm.copy()).to(self.device)[None, None]
+            observed_frame = self.mimi.encode(pcm_tensor)
+            _ = self.other_mimi.encode(pcm_tensor)
+            if observed_frame.shape[-1] != 1:
+                raise RuntimeError(
+                    f"{self.name}: one PCM frame encoded to "
+                    f"{observed_frame.shape[-1]} code frames"
+                )
+            observed_frames.append(observed_frame)
+        observed = torch.cat(observed_frames, dim=2)
+
+        expected_user = np.stack([frame.user_codes for frame in frames], axis=1)
+        observed_user = observed[0].detach().to("cpu", dtype=torch.long).numpy()
+        differing = observed_user != expected_user
+        mismatch_columns = np.any(differing, axis=0)
+        mismatch_indices = np.flatnonzero(mismatch_columns)
+        last_user_mismatch_seq = (
+            None
+            if mismatch_indices.size == 0
+            else frames[int(mismatch_indices[-1])].seq
+        )
+
+        forced_user = (
+            torch.from_numpy(expected_user.copy())
+            .to(self.device, dtype=torch.long)
+            .unsqueeze(0)
+        )
+        forced_targets = (
+            torch.from_numpy(
+                np.stack([frame.assistant_tokens for frame in frames], axis=1)
+            )
+            .to(self.device, dtype=torch.long)
+            .unsqueeze(0)
+        )
+        output = self.lm_gen.prefill_forced_targets(
+            input_tokens=forced_user,
+            target_tokens=forced_targets,
+        )
+        if output is None or output.shape[-1] != len(frames):
+            count = 0 if output is None else int(output.shape[-1])
+            raise RuntimeError(
+                f"{self.name}: {len(frames)} duplex positions produced "
+                f"{count} emitted positions during prefill"
+            )
+
+        decoded_frames: list[torch.Tensor] = []
+        for index in range(output.shape[-1]):
+            output_frame = output[:, 1:9, index : index + 1]
+            decoded_frames.append(self.mimi.decode(output_frame))
+            _ = self.other_mimi.decode(output_frame)
+        decoded = torch.cat(decoded_frames, dim=2)
+        decoded_pcm = decoded[0, 0].detach().to("cpu", dtype=torch.float32).numpy()
+        expected_samples = len(frames) * self.frame_size
+        if decoded_pcm.size != expected_samples:
+            raise RuntimeError(
+                f"{self.name}: duplex prefill decoded {decoded_pcm.size} samples, "
+                f"expected {expected_samples}"
+            )
+        decoded_pcm = decoded_pcm.reshape(len(frames), self.frame_size)
+
+        decoder_frames_compared = 0
+        decoder_mismatches = 0
+        last_decoder_mismatch_seq: int | None = None
+        last_decoder_compared_seq: int | None = None
+        for index, frame in enumerate(frames):
+            emitted_seq = frame.seq - self.max_delay
+            expected_frame = self._replay_frames.pop(emitted_seq, None)
+            if expected_frame is None or expected_frame.played_pcm is None:
+                continue
+            expected_pcm = expected_frame.played_pcm
+            observed_pcm = decoded_pcm[index]
+            if observed_pcm.shape != expected_pcm.shape:
+                raise RuntimeError(
+                    f"{self.name}: prefill PCM shape mismatch at {emitted_seq}: "
+                    f"{observed_pcm.shape} != {expected_pcm.shape}"
+                )
+            mse = float(np.mean(np.square(observed_pcm - expected_pcm)))
+            decoder_frames_compared += 1
+            last_decoder_compared_seq = emitted_seq
+            if mse > self.decoder_mse_threshold:
+                decoder_mismatches += 1
+                last_decoder_mismatch_seq = emitted_seq
+
+        self._sync()
+        return ReplayResult(
+            start_seq=frames[0].seq,
+            end_seq=frames[-1].seq,
+            frames=len(frames),
+            user_code_mismatches=int(np.sum(mismatch_columns)),
+            target_mismatches=0,
+            user_code_values_differ=int(np.sum(differing)),
+            user_codebook_mismatches=tuple(
+                int(value) for value in np.sum(differing, axis=1)
+            ),
+            last_user_mismatch_seq=last_user_mismatch_seq,
+            decoder_frames_compared=decoder_frames_compared,
+            decoder_mismatches=decoder_mismatches,
+            last_decoder_mismatch_seq=last_decoder_mismatch_seq,
+            last_decoder_compared_seq=last_decoder_compared_seq,
         )
 
     @torch.no_grad()
@@ -306,14 +442,27 @@ class AsyncPersonaPlexSlot:
     async def set_seed(self, seed: int) -> None:
         await self._call(self.engine.set_seed, seed)
 
-    async def start_session(self, prompt: str, voice_prompt: str) -> None:
-        await self._call(self.engine.start_session, prompt, voice_prompt)
+    async def start_session(
+        self,
+        prompt: str,
+        voice_prompt: str,
+        text_prefill_chunk_size: int = 64,
+    ) -> None:
+        await self._call(
+            self.engine.start_session,
+            prompt,
+            voice_prompt,
+            text_prefill_chunk_size,
+        )
 
     async def active_step(self, seq: int, pcm: np.ndarray) -> StepResult:
         return await self._call(self.engine.active_step, seq, pcm)
 
     async def replay(self, frames: list[DuplexFrame]) -> ReplayResult:
         return await self._call(self.engine.replay, frames)
+
+    async def prefill_duplex(self, frames: list[DuplexFrame]) -> ReplayResult:
+        return await self._call(self.engine.prefill_duplex, frames)
 
     async def context_frames(self) -> int:
         return await self._call(self.engine.context_frames)
@@ -509,14 +658,27 @@ class ProcessPersonaPlexSlot:
     async def set_seed(self, seed: int) -> None:
         await self._rpc("set_seed", seed)
 
-    async def start_session(self, prompt: str, voice_prompt: str) -> None:
-        await self._rpc("start_session", prompt, voice_prompt)
+    async def start_session(
+        self,
+        prompt: str,
+        voice_prompt: str,
+        text_prefill_chunk_size: int = 64,
+    ) -> None:
+        await self._rpc(
+            "start_session",
+            prompt,
+            voice_prompt,
+            text_prefill_chunk_size,
+        )
 
     async def active_step(self, seq: int, pcm: np.ndarray) -> StepResult:
         return await self._rpc("active_step", seq, pcm)
 
     async def replay(self, frames: list[DuplexFrame]) -> ReplayResult:
         return await self._rpc("replay", frames)
+
+    async def prefill_duplex(self, frames: list[DuplexFrame]) -> ReplayResult:
+        return await self._rpc("prefill_duplex", frames)
 
     async def context_frames(self) -> int:
         return await self._rpc("context_frames")

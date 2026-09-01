@@ -19,12 +19,12 @@ prefix and the known aligned duplex suffix `W`, catches the small delta created
 during preparation, and becomes active by an in-process pointer swap. The
 former active slot is then the shadow for the next installation.
 
-The target data plane treats `[role, M, W]` as one logical batched prefill. The
-current branch still advances `W` with teacher-forced one-frame LM steps because
-upstream `LMGen` only exposes an `S=1` generation path. This is a correctness
-reference rather than the intended performance optimization; it does not
-autoregressively regenerate the conversation. The decision, cost model, exact
-implementation boundary, and batched-prefill acceptance tests are recorded in
+The data plane treats `[role, M, W]` as one logical batched prefill. Role and
+memory text use chunked aligned prefill, while `W` uses delay-corrected `T>1`
+Transformer forwards over the exact duplex ledger. Mimi's fixed-shape CUDA
+graphs still advance one codec frame at a time to restore causal boundary state;
+this does not autoregressively regenerate the conversation. The decision, cost
+model, implementation boundary, and batched-prefill acceptance tests are in
 [`adr/0001-active-shadow-seamless-install.md`](adr/0001-active-shadow-seamless-install.md).
 
 This is intentionally a gateway, not a reverse proxy. Opus reader/writer state,
@@ -34,7 +34,7 @@ process across every swap.
 ## Correctness invariants
 
 1. **No compaction on the response path.** `process_pcm` only enqueues PCM for
-   the memory worker. Compaction, prefix prefill, and bulk replay run in a
+   the memory worker. Compaction and all shadow prefill run in a
    separate task and on separate GPUs.
 2. **Exact cutoff.** GPU 1 must return the requested `cutoff_hint_seq` exactly.
    A different cutoff is rejected so no evidence is lost or represented in
@@ -42,24 +42,23 @@ process across every swap.
 3. **Exact duplex prefill.** The ledger stores each user PCM frame, its eight
    active Mimi codes, and the active model's target-position text plus eight
    assistant codes. `W` is known observed context, so the shadow teacher-forces
-   it rather than sampling it. The current reference implementation forces each
-   target cache position directly; the target implementation performs the same
-   state transition as a batched sequence prefill. Using
+   it rather than sampling it. The default implementation batches the main
+   Transformer while advancing the delay ring exactly. Using
    `LMGen.step(..., moshi_tokens=...)` naively would be incorrect because that
    API applies codebook delays again.
 4. **Codec convergence.** Tail PCM advances the shadow Mimi encoder and the
    forced assistant codes advance its decoder. Initial states may differ
    because pre-cutoff acoustics were discarded; the swap is withheld until
    both user codes and already-played assistant PCM match for configured runs.
-5. **Atomic route change.** Only the final catch-up and pointer update hold the
-   live step lock. A stale result, mismatched replay, timeout, or GPU-1 failure
-   leaves the current active slot untouched.
+5. **Atomic route change.** Only the final delta prefill and pointer update hold
+   the live step lock. A stale result, mismatched prefill, timeout, or GPU-1
+   failure leaves the current active slot untouched.
 6. **Audible boundary.** The normal swap waits for consecutive quiet assistant
    output frames. `force_switch_after_s` is a declared fallback rather than a
    silent timing heuristic.
 7. **Reserve-based trigger.** Installation starts before the context limit.
-   Waiting until the cache is full cannot work because compaction, prefill, and
-   replay all have non-zero latency. This capacity trigger is a fallback policy,
+   Waiting until the cache is full cannot work because compaction and prefill
+   have non-zero latency. This capacity trigger is a fallback policy,
    not a claim that the research trigger problem is solved.
 
 ## GPU-1 memory-worker API
@@ -156,6 +155,8 @@ moshi-seamless-server \
   --port 8998 \
   --active-device cuda:1 \
   --shadow-device cuda:2 \
+  --prefill-batch-frames 64 \
+  --text-prefill-chunk-tokens 64 \
   --memory-worker-url http://127.0.0.1:9010 \
   --control-token "$SEAMLESS_CONTROL_TOKEN"
 ```
@@ -202,10 +203,12 @@ ping-pong swaps, cutoff rejection, silence boundaries, and ledger pinning:
 PYTHONPATH=moshi python -m unittest discover -s moshi/tests -v
 ```
 
-The model-level replay check needs two 48-GB GPUs:
+The sequential-oracle versus batched-prefill check needs two 48-GB GPUs:
 
 ```bash
-PYTHONPATH=moshi python moshi/tests/gpu_seamless_smoke.py
+PYTHONPATH=moshi python moshi/tests/gpu_batched_prefill_benchmark.py \
+  --frames 256 \
+  --output batched-prefill.json
 ```
 
 An end-to-end claim still requires a two-PersonaPlex-GPU soak test plus the
@@ -213,8 +216,8 @@ actual GPU-1 ASR/compactor service. Report at least active-frame p50/p95/p99,
 `M+W` prefill latency by sequence length, effective prefill throughput, final
 delta size, switch pause, audio discontinuity, exact target mismatches, Mimi
 boundary-state equivalence, memory correctness, and unchanged full-duplex
-behavior before treating the installation as seamless. Replay RTF remains
-useful only for the current sequential reference path.
+behavior before treating the installation as seamless. Replay RTF is retained
+only for the sequential equivalence oracle.
 
 The current A40 measurements, catch-up equation, provisional trigger reserve,
 and known bottlenecks are documented in
@@ -226,6 +229,8 @@ PYTHONPATH=moshi python moshi/tests/gpu_process_isolation_benchmark.py \
   --output process-isolation.json
 PYTHONPATH=moshi python moshi/tests/gpu_process_gateway_benchmark.py \
   --output process-gateway.json
+PYTHONPATH=moshi python moshi/tests/gpu_batched_prefill_benchmark.py \
+  --frames 256 --output batched-prefill.json
 PYTHONPATH=moshi python moshi/tests/http_memory_latency_benchmark.py \
   --output memory-transport.json
 ```

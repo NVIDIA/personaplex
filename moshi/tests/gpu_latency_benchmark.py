@@ -302,7 +302,8 @@ async def run_benchmark(
         config = ControllerConfig(
             context_capacity_frames=3000,
             trigger_reserve_frames=1400,
-            replay_batch_frames=args.replay_batch_frames,
+            prefill_batch_frames=args.prefill_batch_frames,
+            text_prefill_chunk_tokens=args.text_prefill_chunk_tokens,
             switch_max_lag_frames=2,
             safe_silence_frames=0,
             force_switch_after_s=0,
@@ -389,7 +390,8 @@ def main() -> None:
     parser.add_argument("--paced-frames", type=int, default=48)
     parser.add_argument("--memory-tokens", type=int, nargs="+", default=[0, 128, 384])
     parser.add_argument("--replay-frames", type=int, nargs="+", default=[32, 128, 256])
-    parser.add_argument("--replay-batch-frames", type=int, default=64)
+    parser.add_argument("--prefill-batch-frames", type=int, default=64)
+    parser.add_argument("--text-prefill-chunk-tokens", type=int, default=64)
     parser.add_argument("--install-at-frame", type=int, default=48)
     parser.add_argument("--controller-timeout-s", type=float, default=90)
     args = parser.parse_args()

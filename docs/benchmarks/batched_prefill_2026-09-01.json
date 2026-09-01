@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-01",
+  "scope": "PersonaPlex batched M+W prefill and process-isolated handoff",
+  "hardware": ["NVIDIA A40 48 GB", "NVIDIA A40 48 GB"],
+  "runtime": {
+    "partition": "vram48",
+    "qos": "q-high-sehun.lee",
+    "text_prefill_chunk_tokens": 64,
+    "duplex_prefill_chunk_frames": 64
+  },
+  "sequential_oracle_vs_batched": {
+    "64_frames": {
+      "audio_duration_s": 5.12,
+      "jobs": [1370876],
+      "sequential": {
+        "text_memory_prefix_s": 6.5245,
+        "duplex_suffix_s": 4.1115,
+        "total_install_state_s": 10.6360
+      },
+      "batched": {
+        "text_memory_prefix_s": 4.1889,
+        "duplex_suffix_s": 1.0383,
+        "total_install_state_s": 5.2272
+      },
+      "speedup": {
+        "text_memory_prefix": 1.5576,
+        "duplex_suffix": 3.9597,
+        "total_install_state": 2.0347
+      }
+    },
+    "256_frames": {
+      "audio_duration_s": 20.48,
+      "jobs": [1370877],
+      "sequential": {
+        "text_memory_prefix_s": 6.5201,
+        "duplex_suffix_s": 16.0551,
+        "total_install_state_s": 22.5752
+      },
+      "batched": {
+        "text_memory_prefix_s": 4.2485,
+        "duplex_suffix_s": 3.9197,
+        "total_install_state_s": 8.1681
+      },
+      "speedup": {
+        "text_memory_prefix": 1.5347,
+        "duplex_suffix": 4.0960,
+        "total_install_state": 2.7638
+      }
+    },
+    "equivalence": {
+      "user_code_mismatches": 0,
+      "forced_target_mismatches": 0,
+      "decoder_mismatches": 0,
+      "next_user_codes_equal": true,
+      "next_assistant_targets_equal": true,
+      "next_output_pcm_mse": 0.0
+    }
+  },
+  "live_gateway": {
+    "job": 1370881,
+    "completed_swap": true,
+    "trigger_to_swap_s": 15.4195,
+    "text_memory_prefill_s": 3.1307,
+    "duplex_prefill_s": 9.2933,
+    "final_delta_frames": 1,
+    "final_delta_prefill_s": 0.0591,
+    "critical_section_s": 0.0591,
+    "active_during_install_ms": {
+      "frames": 193,
+      "mean": 64.1427,
+      "p95": 64.4899,
+      "p99": 65.0114,
+      "max": 107.7546,
+      "deadline_miss_rate": 0.00518
+    },
+    "readiness": {
+      "prefilled_through_seq": 239,
+      "codec_match_run": 16,
+      "decoder_match_run": 47,
+      "forced_boundary": true
+    }
+  },
+  "implementation": {
+    "transformer": "T>1 causal forward with delay-corrected known duplex streams",
+    "lmgen_state": "offset, provided mask, and delayed token ring advanced exactly as forced steps",
+    "mimi": "one-frame CUDA-graph-safe causal state advancement",
+    "fallback": "sequential PersonaPlexSlotEngine.replay retained as equivalence oracle"
+  },
+  "remaining_bottleneck": "Mimi encoder state starts after the semantic cutoff and required a long washout before 16 consecutive code matches in the live gateway run.",
+  "measurement_cost": {
+    "openai_api_usd": 0.0,
+    "allocated_gpu_hours_including_failed_diagnostics": 0.1861,
+    "jobs": [1370870, 1370874, 1370876, 1370877, 1370881]
+  }
+}

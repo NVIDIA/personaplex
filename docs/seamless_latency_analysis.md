@@ -1,9 +1,10 @@
 # Seamless-install latency analysis
 
 This report records the 2026-09-01 measurements behind the process-isolated
-PersonaPlex gateway. The main result is narrow but useful: **the active audio
-path can remain within its 80 ms codec-frame deadline during installation, but
-the current shadow preparation is too slow to call the overall system mature.**
+PersonaPlex gateway and its subsequent batched-prefill update. **The active
+audio path remains within its 80 ms p95 frame budget during installation, and
+batched `M+W` preparation is substantially faster; reset-Mimi state convergence
+is now the dominant readiness bottleneck.**
 
 Raw summary values are in
 [`benchmarks/seamless_latency_2026-09-01.json`](benchmarks/seamless_latency_2026-09-01.json).
@@ -13,6 +14,27 @@ Raw summary values are in
 > cheap atomic handoff, but they are not measurements of the intended batched
 > `[role, M, W]` prefill. The target design and migration boundary are recorded
 > in [`adr/0001-active-shadow-seamless-install.md`](adr/0001-active-shadow-seamless-install.md).
+
+## Batched-prefill update
+
+The `M+W` path is now implemented. New raw summaries are in
+[`benchmarks/batched_prefill_2026-09-01.json`](benchmarks/batched_prefill_2026-09-01.json).
+
+| suffix | sequential suffix | batched suffix | suffix speedup | sequential total | batched total | total speedup |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 frames | 4.11 s | 1.04 s | 3.96× | 10.64 s | 5.23 s | 2.03× |
+| 256 frames | 16.06 s | 3.92 s | 4.10× | 22.58 s | 8.17 s | 2.76× |
+
+Both process-isolated comparisons had zero user-code, forced-target, and
+decoder mismatches. With the same next-step seed, assistant targets were equal
+and output PCM MSE was 0.
+
+The live controller completed its swap in 15.42 s. The prefix took 3.13 s,
+duplex prefill and codec convergence took 9.29 s, the final delta was one frame,
+and the critical section was 59.1 ms. Active p95 during installation was
+64.49 ms. The remaining delay is dominated by reset-Mimi encoder washout, not
+Transformer prefill. The sequential replay-rate model below is retained only
+as the historical baseline.
 
 ## Measurement scope
 
@@ -92,8 +114,8 @@ T_ready = (C + P) + f(C + P)/(R - f)
 
 For the manual run, `C=0` predicts 31.58 s, close to the observed 31.98 s. This
 agreement makes the model useful for provisional capacity planning of the
-current implementation only. A true batched `M+W` prefill must be measured as a
-new path; the replay-rate equation must not be carried over to it.
+historical implementation only. The subsequently measured batched path is
+reported above; this replay-rate equation must not be carried over to it.
 
 The prior 24-condition compactor artifact has mean 6.325 s and p95 6.743 s.
 Combining it with this gateway gives:
@@ -137,16 +159,16 @@ trigger**; it must be measured in the real GPU-1 service.
 
 1. **Do not return to a shared CUDA process.** Separate model processes remove
    active deadline regressions and CUDA-graph contamination.
-2. **Add pre-cutoff codec state restoration.** The current shadow begins raw
-   replay after the semantic compact cutoff, so it must wait for enough new
-   audio to wash out the discarded causal Mimi state. A state-only acoustic
+2. **Add pre-cutoff codec state restoration.** The shadow currently advances
+   Mimi only from the semantic compact cutoff, so it must wait for enough new
+   audio to wash out the discarded causal codec state. A state-only acoustic
    pre-roll, or an explicit encoder/decoder state snapshot, should be prepared
    without reintroducing pre-cutoff facts into the LM context.
-3. **Implement batched duplex prefill.** The current tail path performs
-   per-frame LM stepping, validation, and transfers. Add a delay-correct
-   `prefill_duplex()` that advances the Transformer cache over sequence chunks
-   while preserving LMGen's token ring and Mimi boundary state. Retain the
-   sequential path as the equivalence oracle and rollback mode.
+3. **Optimize the implemented batched duplex prefill.** The 7B Transformer now
+   advances over sequence chunks while LMGen's token ring remains aligned.
+   Mimi remains one-frame stepped because its CUDA graphs have fixed shapes.
+   Test codec-state snapshots or a state-only acoustic pre-roll, then consider
+   shape-specific batched Mimi graphs.
 4. **Measure the actual third GPU.** Implement and deploy streaming ASR plus the
    compactor contract, then report ASR watermark lag, compaction p95, and true
    trigger-to-swap together.

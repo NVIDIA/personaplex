@@ -70,8 +70,8 @@ gateway that alternates between two resident PersonaPlex GPUs while a third GPU
 runs streaming ASR and compaction. See
 [`docs/seamless_install.md`](docs/seamless_install.md) for the architecture,
 memory-worker contract, correctness invariants, and launch commands. The
-active-shadow decision, target `M+W` batched-prefill path, current implementation
-gap, and acceptance tests are in
+active-shadow decision, implemented `M+W` batched-prefill path, remaining codec
+boundary gap, and acceptance tests are in
 [`docs/adr/0001-active-shadow-seamless-install.md`](docs/adr/0001-active-shadow-seamless-install.md).
 
 ### Offline Evaluation

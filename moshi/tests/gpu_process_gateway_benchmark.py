@@ -81,7 +81,8 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         config = ControllerConfig(
             context_capacity_frames=3000,
             trigger_reserve_frames=256,
-            replay_batch_frames=64,
+            prefill_batch_frames=64,
+            text_prefill_chunk_tokens=64,
             switch_max_lag_frames=2,
             safe_silence_frames=0,
             force_switch_after_s=0,

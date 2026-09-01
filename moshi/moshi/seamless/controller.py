@@ -28,11 +28,18 @@ from .types import (
 class PersonaPlexSlot(Protocol):
     name: str
 
-    async def start_session(self, prompt: str, voice_prompt: str) -> None: ...
+    async def start_session(
+        self,
+        prompt: str,
+        voice_prompt: str,
+        text_prefill_chunk_size: int = 64,
+    ) -> None: ...
 
     async def active_step(self, seq: int, pcm: np.ndarray) -> StepResult: ...
 
     async def replay(self, frames: list) -> ReplayResult: ...
+
+    async def prefill_duplex(self, frames: list) -> ReplayResult: ...
 
 
 EventSink = Callable[[dict[str, Any]], Any]
@@ -43,8 +50,8 @@ class SeamlessInstallController:
 
     There is exactly one serialization point: ``_step_lock``. Normal active
     inference holds it for one codec frame. Installation does not hold it
-    during compaction, prefill, or bulk replay; it acquires it only for the
-    final (normally tiny) catch-up and pointer swap.
+    during compaction or batched ``M+W`` prefill; it acquires it only for the
+    final (normally tiny) delta prefill and pointer swap.
     """
 
     def __init__(
@@ -127,8 +134,16 @@ class SeamlessInstallController:
             # embedding is then cached and does not inflate first-handoff
             # latency by several seconds.
             await asyncio.gather(
-                self.active_slot.start_session(self._role_prompt, voice_prompt),
-                self.shadow_slot.start_session(self._role_prompt, voice_prompt),
+                self.active_slot.start_session(
+                    self._role_prompt,
+                    voice_prompt,
+                    self.config.text_prefill_chunk_tokens,
+                ),
+                self.shadow_slot.start_session(
+                    self._role_prompt,
+                    voice_prompt,
+                    self.config.text_prefill_chunk_tokens,
+                ),
             )
         except Exception:
             if memory_started:
@@ -283,7 +298,8 @@ class SeamlessInstallController:
                 "old_active": self._last_swap.old_active,
                 "new_active": self._last_swap.new_active,
                 "cutoff_seq": self._last_swap.cutoff_seq,
-                "replayed_through_seq": self._last_swap.replayed_through_seq,
+                "replayed_through_seq": self._last_swap.prefilled_through_seq,
+                "prefilled_through_seq": self._last_swap.prefilled_through_seq,
                 "forced_boundary": self._last_swap.forced_boundary,
                 "request_id": self._last_swap.request_id,
                 "timings": self._last_swap.timings,
@@ -394,6 +410,7 @@ class SeamlessInstallController:
         await shadow.start_session(
             self._compose_installed_prompt(compact.memory),
             self._voice_prompt,
+            self.config.text_prefill_chunk_tokens,
         )
         prefill_wall_s = time.perf_counter() - prefill_started
         await self._emit(
@@ -404,27 +421,27 @@ class SeamlessInstallController:
         self._require_generation(generation)
 
         self.phase = ControllerPhase.CATCHING_UP
-        replayed_through = compact.cutoff_seq
+        prefilled_through = compact.cutoff_seq
         codec_match_run = 0
         decoder_match_run = 0
-        bulk_replay_wall_s = 0.0
+        duplex_prefill_wall_s = 0.0
         ready_at: float | None = None
         while True:
             self._require_generation(generation)
-            replay_started = time.perf_counter()
+            duplex_prefill_started = time.perf_counter()
             (
-                replayed_through,
+                prefilled_through,
                 codec_match_run,
                 decoder_match_run,
-            ) = await self._replay_available(
+            ) = await self._prefill_available(
                 shadow,
-                replayed_through,
+                prefilled_through,
                 codec_match_run,
                 decoder_match_run,
                 request_id,
             )
-            bulk_replay_wall_s += time.perf_counter() - replay_started
-            lag = self.ledger.latest_seq - replayed_through
+            duplex_prefill_wall_s += time.perf_counter() - duplex_prefill_started
+            lag = self.ledger.latest_seq - prefilled_through
             codec_ready = codec_match_run >= self.config.codec_convergence_frames
             decoder_ready = decoder_match_run >= self.config.decoder_convergence_frames
             if (
@@ -453,7 +470,7 @@ class SeamlessInstallController:
                     await self._atomic_catchup_and_swap(
                         generation=generation,
                         shadow=shadow,
-                        replayed_through=replayed_through,
+                        prefilled_through=prefilled_through,
                         codec_match_run=codec_match_run,
                         decoder_match_run=decoder_match_run,
                         compact=compact,
@@ -462,7 +479,7 @@ class SeamlessInstallController:
                         install_started=install_started,
                         compact_wall_s=compact_wall_s,
                         prefill_wall_s=prefill_wall_s,
-                        bulk_replay_wall_s=bulk_replay_wall_s,
+                        duplex_prefill_wall_s=duplex_prefill_wall_s,
                         ready_at=ready_at,
                     )
                     return
@@ -512,7 +529,7 @@ class SeamlessInstallController:
         if result.parent_version != self._memory_version:
             raise RuntimeError("memory worker returned a stale parent_version")
         # An exact cutoff is a correctness contract, not a suggestion. It
-        # prevents both replay gaps and double-counted live-tail information.
+        # prevents both prefill gaps and double-counted live-tail information.
         if result.cutoff_seq != cutoff_hint:
             raise RuntimeError(
                 f"memory worker cutoff {result.cutoff_seq} != requested {cutoff_hint}"
@@ -520,44 +537,44 @@ class SeamlessInstallController:
         if not result.memory.strip():
             raise RuntimeError("memory worker returned empty memory")
 
-    async def _replay_available(
+    async def _prefill_available(
         self,
         shadow: PersonaPlexSlot,
-        replayed_through: int,
+        prefilled_through: int,
         codec_match_run: int,
         decoder_match_run: int,
         request_id: str,
     ) -> tuple[int, int, int]:
         latest = self.ledger.latest_seq
-        start = replayed_through + 1
+        start = prefilled_through + 1
         while start <= latest:
-            end = min(start + self.config.replay_batch_frames, latest + 1)
+            end = min(start + self.config.prefill_batch_frames, latest + 1)
             batch = self.ledger.slice(start, end)
-            replay = await shadow.replay(batch)
-            self._require_exact_target_replay(replay)
-            codec_match_run = self._updated_codec_match_run(codec_match_run, replay)
+            prefill = await shadow.prefill_duplex(batch)
+            self._require_exact_target_prefill(prefill)
+            codec_match_run = self._updated_codec_match_run(codec_match_run, prefill)
             decoder_match_run = self._updated_decoder_match_run(
-                decoder_match_run, replay
+                decoder_match_run, prefill
             )
-            replayed_through = replay.end_seq
+            prefilled_through = prefill.end_seq
             await self._emit(
-                "install_replay_progress",
+                "install_duplex_prefill_progress",
                 request_id=request_id,
-                replayed_through_seq=replayed_through,
-                lag_frames=self.ledger.latest_seq - replayed_through,
+                prefilled_through_seq=prefilled_through,
+                lag_frames=self.ledger.latest_seq - prefilled_through,
                 codec_match_run=codec_match_run,
                 decoder_match_run=decoder_match_run,
             )
-            start = replayed_through + 1
+            start = prefilled_through + 1
             latest = self.ledger.latest_seq
-        return replayed_through, codec_match_run, decoder_match_run
+        return prefilled_through, codec_match_run, decoder_match_run
 
     async def _atomic_catchup_and_swap(
         self,
         *,
         generation: int,
         shadow: PersonaPlexSlot,
-        replayed_through: int,
+        prefilled_through: int,
         codec_match_run: int,
         decoder_match_run: int,
         compact: CompactResult,
@@ -566,29 +583,33 @@ class SeamlessInstallController:
         install_started: float,
         compact_wall_s: float,
         prefill_wall_s: float,
-        bulk_replay_wall_s: float,
+        duplex_prefill_wall_s: float,
         ready_at: float | None,
     ) -> int:
         lock_requested = time.perf_counter()
-        final_replay_frames = 0
-        final_replay_wall_s = 0.0
+        final_delta_frames = 0
+        final_delta_prefill_wall_s = 0.0
         async with self._step_lock:
             lock_acquired = time.perf_counter()
             self._require_generation(generation)
             latest = self.ledger.latest_seq
-            if replayed_through < latest:
-                final_replay_frames = latest - replayed_through
-                final_replay_started = time.perf_counter()
-                replay = await shadow.replay(
-                    self.ledger.slice(replayed_through + 1, latest + 1)
+            if prefilled_through < latest:
+                final_delta_frames = latest - prefilled_through
+                final_delta_prefill_started = time.perf_counter()
+                prefill = await shadow.prefill_duplex(
+                    self.ledger.slice(prefilled_through + 1, latest + 1)
                 )
-                final_replay_wall_s = time.perf_counter() - final_replay_started
-                self._require_exact_target_replay(replay)
-                codec_match_run = self._updated_codec_match_run(codec_match_run, replay)
+                final_delta_prefill_wall_s = (
+                    time.perf_counter() - final_delta_prefill_started
+                )
+                self._require_exact_target_prefill(prefill)
+                codec_match_run = self._updated_codec_match_run(
+                    codec_match_run, prefill
+                )
                 decoder_match_run = self._updated_decoder_match_run(
-                    decoder_match_run, replay
+                    decoder_match_run, prefill
                 )
-                replayed_through = replay.end_seq
+                prefilled_through = prefill.end_seq
             if codec_match_run < self.config.codec_convergence_frames:
                 raise RuntimeError(
                     "shadow Mimi encoder did not converge before swap: "
@@ -613,21 +634,21 @@ class SeamlessInstallController:
                 "trigger_to_swap_s": swapped_at - install_started,
                 "compaction_s": compact_wall_s,
                 "prefill_s": prefill_wall_s,
-                "bulk_replay_s": bulk_replay_wall_s,
+                "duplex_prefill_s": duplex_prefill_wall_s,
                 "safe_boundary_wait_s": (
                     0.0 if ready_at is None else max(0.0, lock_requested - ready_at)
                 ),
                 "step_lock_wait_s": lock_acquired - lock_requested,
-                "final_replay_s": final_replay_wall_s,
+                "final_delta_prefill_s": final_delta_prefill_wall_s,
                 "critical_section_s": swapped_at - lock_acquired,
-                "final_replay_frames": float(final_replay_frames),
+                "final_delta_frames": float(final_delta_frames),
             }
             self._last_swap = SwapRecord(
                 version=self._memory_version,
                 old_active=old_active,
                 new_active=self.active_slot.name,
                 cutoff_seq=compact.cutoff_seq,
-                replayed_through_seq=replayed_through,
+                prefilled_through_seq=prefilled_through,
                 forced_boundary=forced_boundary,
                 memory=self._memory,
                 request_id=compact.request_id,
@@ -642,11 +663,11 @@ class SeamlessInstallController:
             old_active=old_active,
             new_active=self.active_slot.name,
             cutoff_seq=compact.cutoff_seq,
-            replayed_through_seq=replayed_through,
+            prefilled_through_seq=prefilled_through,
             forced_boundary=forced_boundary,
             timings=timings,
         )
-        return replayed_through
+        return prefilled_through
 
     async def _wait_for_next_frame_or_boundary_timer(
         self, ready_at: float | None
@@ -676,7 +697,7 @@ class SeamlessInstallController:
             return False
         # A malformed or overlong compact memory can start above the trigger
         # threshold. Avoid an install storm while surfacing the condition.
-        min_gap = max(self.config.replay_batch_frames, 1)
+        min_gap = max(self.config.prefill_batch_frames, 1)
         return self.ledger.latest_seq - self._last_trigger_seq >= min_gap
 
     def _compose_installed_prompt(self, memory: str) -> str:
@@ -705,12 +726,12 @@ class SeamlessInstallController:
         return self._session_id
 
     @staticmethod
-    def _require_exact_target_replay(replay: ReplayResult) -> None:
-        if replay.target_mismatches:
+    def _require_exact_target_prefill(prefill: ReplayResult) -> None:
+        if prefill.target_mismatches:
             raise RuntimeError(
-                "shadow replay diverged: "
-                f"target={replay.target_mismatches}, "
-                f"range={replay.start_seq}:{replay.end_seq}"
+                "shadow duplex prefill diverged: "
+                f"target={prefill.target_mismatches}, "
+                f"range={prefill.start_seq}:{prefill.end_seq}"
             )
 
     @staticmethod

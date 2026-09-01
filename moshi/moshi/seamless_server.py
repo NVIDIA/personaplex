@@ -348,7 +348,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory-queue-frames", type=int, default=256)
     parser.add_argument("--context-capacity-frames", type=int, default=3000)
     parser.add_argument("--trigger-reserve-frames", type=int, default=1400)
-    parser.add_argument("--replay-batch-frames", type=int, default=64)
+    parser.add_argument(
+        "--prefill-batch-frames",
+        "--replay-batch-frames",
+        dest="prefill_batch_frames",
+        type=int,
+        default=64,
+        help=(
+            "duplex positions per batched Transformer prefill; "
+            "--replay-batch-frames is a deprecated alias"
+        ),
+    )
+    parser.add_argument("--text-prefill-chunk-tokens", type=int, default=64)
     parser.add_argument("--switch-max-lag-frames", type=int, default=2)
     parser.add_argument("--safe-silence-frames", type=int, default=3)
     parser.add_argument("--silence-rms-threshold", type=float, default=0.004)
@@ -452,7 +463,8 @@ def main() -> None:
         config = ControllerConfig(
             context_capacity_frames=args.context_capacity_frames,
             trigger_reserve_frames=args.trigger_reserve_frames,
-            replay_batch_frames=args.replay_batch_frames,
+            prefill_batch_frames=args.prefill_batch_frames,
+            text_prefill_chunk_tokens=args.text_prefill_chunk_tokens,
             switch_max_lag_frames=args.switch_max_lag_frames,
             safe_silence_frames=args.safe_silence_frames,
             silence_rms_threshold=args.silence_rms_threshold,

@@ -873,6 +873,173 @@ class LMGen(StreamingModule[_LMGenState]):
         )
 
     @torch.no_grad()
+    def prefill_aligned(
+        self,
+        *,
+        input_tokens: torch.Tensor,
+        moshi_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+    ) -> None:
+        """Prefill known aligned streams with one causal Transformer call.
+
+        ``step`` is a generation API and intentionally accepts one time step.
+        During prompt installation all three streams are already known, so the
+        expensive main Transformer can consume their delay-corrected model
+        inputs as a sequence.  The small LMGen delay ring is still advanced one
+        logical position at a time so the resulting streaming state is exactly
+        shaped like repeated forced steps.
+        """
+
+        if input_tokens.dim() != 3 or moshi_tokens.dim() != 3:
+            raise ValueError("audio prefill tensors must have shape [B, K, T]")
+        if text_tokens.dim() != 2:
+            raise ValueError("text prefill tensor must have shape [B, T]")
+        if input_tokens.shape != moshi_tokens.shape:
+            raise ValueError("user and assistant audio prefill shapes must match")
+        if input_tokens.shape[0] != text_tokens.shape[0]:
+            raise ValueError("prefill batch sizes must match")
+        if input_tokens.shape[2] != text_tokens.shape[1]:
+            raise ValueError("prefill sequence lengths must match")
+
+        model_inputs: list[torch.Tensor] = []
+        for index in range(input_tokens.shape[2]):
+            prepared = self.prepare_step_input(
+                input_tokens=input_tokens[:, :, index : index + 1],
+                moshi_tokens=moshi_tokens[:, :, index : index + 1],
+                text_token=text_tokens[:, index],
+            )
+            model_input = self._consume_fully_forced_step(prepared)
+            if model_input is not None:
+                model_inputs.append(model_input)
+        self._forward_prefill_inputs(model_inputs)
+
+    @torch.no_grad()
+    def prefill_forced_targets(
+        self,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Prefill a known duplex suffix and return its emitted assistant codes.
+
+        ``target_tokens`` are delay-corrected target-cache positions captured
+        from the active LMGen, not an aligned assistant stream.  Writing them
+        directly avoids applying PersonaPlex's codebook delays twice.
+        """
+
+        state = self._streaming_state
+        if state is None:
+            raise RuntimeError("LMGen must be streaming before duplex prefill")
+        if input_tokens.dim() != 3 or target_tokens.dim() != 3:
+            raise ValueError("duplex prefill tensors must have shape [B, K, T]")
+        if input_tokens.shape[0] != target_tokens.shape[0]:
+            raise ValueError("duplex prefill batch sizes must match")
+        if input_tokens.shape[2] != target_tokens.shape[2]:
+            raise ValueError("duplex prefill sequence lengths must match")
+        needed_input_tokens = (
+            self.lm_model.num_codebooks - AUDIO_TOKENS_PER_STREAM - 1
+        )
+        if input_tokens.shape[1] != needed_input_tokens:
+            raise ValueError(
+                f"expected {needed_input_tokens} user codebooks, "
+                f"got {input_tokens.shape[1]}"
+            )
+        assistant_target_streams = AUDIO_TOKENS_PER_STREAM + 1
+        if target_tokens.shape[1] != assistant_target_streams:
+            raise ValueError(
+                f"expected {assistant_target_streams} assistant target streams, "
+                f"got {target_tokens.shape[1]}"
+            )
+
+        model_inputs: list[torch.Tensor] = []
+        emitted: list[torch.Tensor] = []
+        cache_time = int(state.cache.shape[2])
+        for index in range(input_tokens.shape[2]):
+            target_position = int(state.offset) % cache_time
+            state.cache[:, :assistant_target_streams, target_position] = (
+                target_tokens[:, :, index]
+            )
+            state.provided[:, :assistant_target_streams, target_position] = True
+            prepared = self.prepare_step_input(
+                input_tokens=input_tokens[:, :, index : index + 1]
+            )
+            output = self._known_output_at_current_offset()
+            model_input = self._consume_fully_forced_step(prepared)
+            if model_input is not None:
+                model_inputs.append(model_input)
+            if output is not None:
+                emitted.append(output)
+
+        self._forward_prefill_inputs(model_inputs)
+        if not emitted:
+            return None
+        return torch.cat(emitted, dim=2)
+
+    def _consume_fully_forced_step(
+        self,
+        prepared_inputs: tuple | None,
+    ) -> torch.Tensor | None:
+        state = self._streaming_state
+        if state is None:
+            raise RuntimeError("LMGen must be streaming during prefill")
+        if prepared_inputs is None:
+            # ``prepare_step_input`` performs the offset-zero initialization.
+            return None
+        input_, provided_, _, model_input_position, _ = prepared_inputs
+        assistant_provided = provided_[:, : self.lm_model.dep_q + 1]
+        if self.check and not bool(torch.all(assistant_provided).item()):
+            raise RuntimeError(
+                "batched prefill requires every assistant target to be known"
+            )
+        state.provided[:, :, model_input_position] = False
+        state.offset += 1
+        return input_.clone()
+
+    def _known_output_at_current_offset(self) -> torch.Tensor | None:
+        state = self._streaming_state
+        if state is None:
+            raise RuntimeError("LMGen must be streaming during prefill")
+        if state.offset <= self.max_delay:
+            return None
+        batch_size = state.cache.shape[0]
+        cache_time = state.cache.shape[2]
+        delays = self.delays_cuda[: self.lm_model.dep_q + 1]
+        index = (
+            ((state.offset - self.max_delay + delays) % cache_time)
+            .view(1, -1, 1)
+            .expand(batch_size, -1, 1)
+        )
+        return state.cache.gather(dim=2, index=index).clone()
+
+    def _forward_prefill_inputs(self, model_inputs: list[torch.Tensor]) -> None:
+        if not model_inputs:
+            return
+        sequence = torch.cat(model_inputs, dim=2)
+        transformer = self.lm_model.transformer
+        transformer_state = transformer._streaming_state
+        if transformer_state is None:
+            raise RuntimeError("main Transformer must be streaming during prefill")
+        context = transformer.layers[0].self_attn.context
+        if context is None:
+            # PersonaPlex uses a finite streaming context, but retain a safe
+            # unbounded fallback for compatible checkpoints.
+            self.lm_model.forward_codes(sequence)
+            return
+
+        # RingKVCache commits a whole time chunk before attention.  A chunk is
+        # exactly equivalent to sequential stepping only while it cannot
+        # overwrite context needed by an early query in that same chunk.  Once
+        # the ring is full, fall back to length-one calls for correctness.
+        start = 0
+        total = sequence.shape[2]
+        while start < total:
+            offset = int(transformer_state.offset.item())
+            available = max(0, int(context) - offset)
+            width = min(total - start, available) if available else 1
+            self.lm_model.forward_codes(sequence[:, :, start : start + width])
+            start += width
+
+    @torch.no_grad()
     def process_transformer_output(self, transformer_out, text_logits, provided_, target_, model_input_position, target_position):
         state = self._streaming_state
         lm_model = self.lm_model
@@ -1109,6 +1276,30 @@ class LMGen(StreamingModule[_LMGenState]):
         for _ in self._step_text_prompt_core():
             pass
 
+    def _step_text_prompt_prefill(self, chunk_size: int) -> None:
+        if chunk_size <= 0:
+            raise ValueError("text prefill chunk size must be positive")
+        if chunk_size == 1:
+            self._step_text_prompt()
+            return
+        if not self.text_prompt_tokens:
+            return
+        input_frame = self._encode_sine_frame()
+        assistant_frame = self._encode_zero_frame()
+        for start in range(0, len(self.text_prompt_tokens), chunk_size):
+            values = self.text_prompt_tokens[start : start + chunk_size]
+            steps = len(values)
+            self.prefill_aligned(
+                input_tokens=input_frame.expand(-1, -1, steps),
+                moshi_tokens=assistant_frame.expand(-1, -1, steps),
+                text_tokens=torch.as_tensor(
+                    values,
+                    dtype=torch.long,
+                    device=self.lm_model.device,
+                ).view(1, steps),
+            )
+        print('Done loading text prompt with batched prefill.')
+
     async def _step_text_prompt_async(self, is_alive: Optional[Callable]=None):
         for _ in self._step_text_prompt_core():
             if is_alive is not None and not await is_alive():
@@ -1124,6 +1315,19 @@ class LMGen(StreamingModule[_LMGenState]):
         self._step_voice_prompt(mimi)
         self._step_audio_silence()
         self._step_text_prompt()
+        self._step_audio_silence()
+
+    def step_system_prompts_prefill(
+        self,
+        mimi,
+        *,
+        text_chunk_size: int,
+    ) -> None:
+        """Load the normal PersonaPlex prefix with batched text/M prefill."""
+
+        self._step_voice_prompt(mimi)
+        self._step_audio_silence()
+        self._step_text_prompt_prefill(text_chunk_size)
         self._step_audio_silence()
 
     def depformer_step(
@@ -1175,4 +1379,3 @@ class LMGen(StreamingModule[_LMGenState]):
             return tokens, all_logits
         else:
             return tokens
-

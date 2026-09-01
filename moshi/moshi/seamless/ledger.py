@@ -12,7 +12,7 @@ from .types import DuplexFrame
 
 
 class DuplexFrameLedger:
-    """Monotonic replay log with a playout watermark and install pin."""
+    """Monotonic prefill ledger with a playout watermark and install pin."""
 
     def __init__(self, max_frames: int = 20_000) -> None:
         if max_frames <= 0:
@@ -121,7 +121,7 @@ class DuplexFrameLedger:
             first = self.first_seq
             if self._pin_start is not None and first >= self._pin_start:
                 # Installation must not interrupt the live audio path merely
-                # because prefill/replay is slow. Temporarily exceed the soft
+                # because shadow prefill is slow. Temporarily exceed the soft
                 # bound, then trim immediately when the install releases its
                 # pin. The controller's install timeout bounds this growth.
                 return

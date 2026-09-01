@@ -1,6 +1,6 @@
 # ADR 0001: Active-shadow installation for PersonaPlex memory
 
-- Status: accepted architecture; batched duplex prefill pending
+- Status: accepted and implemented; end-to-end soak validation pending
 - Date: 2026-09-01
 - Scope: installing compact conversation memory without interrupting a live
   full-duplex PersonaPlex session
@@ -96,7 +96,7 @@ Until these are tested end to end, the precise claim is that the architecture
 **enables** seamless installation, not that every current run is already
 perceptually seamless.
 
-## Target state transition
+## Implemented state transition
 
 1. The gateway pins the ledger at `C + 1` and asks the writer for cumulative
    memory through exactly `C`.
@@ -130,40 +130,35 @@ The branch already implements the production control plane:
 | CPU correctness tests | `moshi/tests/test_seamless_*.py` |
 | two-GPU measurements | `docs/seamless_latency_analysis.md` |
 
-The current model data plane is a correctness reference, not yet the target
-optimization:
+The optimized data plane is now the controller default:
 
 ```text
-current branch
-  start_session([role, M])
-  + teacher-forced frame steps over W
-  + teacher-forced final delta
+default implementation
+  batched text prefill([role, M])
+  + prefill_duplex(W_snapshot) in T>1 chunks
+  + prefill_duplex(ΔW)
   + atomic swap
 
-target implementation
-  prefill_duplex([role, M, W_snapshot])
-  + batched prefill of ΔW
-  + atomic swap
+equivalence oracle / rollback
+  sequential text steps([role, M])
+  + PersonaPlexSlotEngine.replay(W)
 ```
 
-`PersonaPlexSlotEngine.replay()` currently advances `LMGen.step()` one codec
-frame at a time. It uses known assistant target positions, so it is not an
-autoregressive conversational rollout, but it also does not realize the
-parallel sequence prefill assumed by the target design. The existing
-`bulk_replay_s`, replay-RTF, and `R/(R-f)` measurements characterize only this
-reference implementation.
+`LMGen.prefill_aligned()` batches the role and memory text streams.
+`LMGen.prefill_forced_targets()` builds delay-corrected Transformer inputs from
+the ledger while advancing LMGen's short ring exactly as repeated forced steps
+would. `PersonaPlexSlotEngine.prefill_duplex()` restores the Mimi boundary state
+and calls the main 7B Transformer with `T>1`. The controller uses this method for
+both the snapshot suffix and final delta. `--prefill-batch-frames` and
+`--text-prefill-chunk-tokens` default to 64.
 
-The reason is explicit in the upstream generation interface:
-`LMGen.prepare_step_input()` currently asserts `S == 1`. The underlying causal
-Transformer accepts a time dimension, but a correct `prefill_duplex()` must also
-maintain LMGen's delayed multi-stream ring, teacher-forced target positions, and
-Mimi encoder/decoder boundary state. Calling `forward_codes()` on concatenated
-tokens without reconstructing those states would create a fast but invalid
-handoff.
+Mimi remains one-frame stepped because its production encoder/decoder CUDA
+graphs are captured at a fixed codec-frame shape. This is codec-state
+advancement, not autoregressive conversation replay; the expensive 7B LM is
+still sequence-prefilled. `PersonaPlexSlotEngine.replay()` remains available as
+the sequential equivalence oracle.
 
-## Required batched-prefill implementation
-
-Add a model-level `prefill_duplex(frames)` path with these properties:
+The implementation has these properties:
 
 1. Build the delay-corrected model-input sequence from each frame's stored
    eight user codes and target-position text plus eight assistant codes.
@@ -171,19 +166,16 @@ Add a model-level `prefill_duplex(frames)` path with these properties:
    cache remains in streaming mode.
 3. Advance LMGen's offset, provided-mask, and short delayed-token ring exactly
    as repeated forced steps would.
-4. Advance or restore the Mimi encoder and decoder state at the same boundary.
-   Batched PCM encode/decode, a state snapshot, and state-only acoustic pre-roll
-   are valid candidates; skipping codec restoration is not.
-5. Return the same validation information currently carried by `ReplayResult`,
-   renamed around prefill semantics when the migration is complete.
-6. Keep a small sequential forced-step fallback for equivalence tests and
-   operational rollback.
+4. Advance Mimi's encoder and decoder at the same boundary with their existing
+   fixed-shape CUDA graphs.
+5. Return target, encoder-code, and decoded-PCM validation information.
+6. Keep sequential forced steps for equivalence tests and operational rollback.
 
 ## Acceptance tests
 
 For identical role, voice, memory, and duplex frames, compare sequential forced
-steps with batched prefill at multiple chunk sizes. Before enabling the target
-path by default, require:
+steps with batched prefill at multiple chunk sizes. The implemented path has
+already met the following model-level requirements at 64 and 256 frames:
 
 - identical Transformer KV offsets and cache contents within numerical
   tolerance;
@@ -192,10 +184,11 @@ path by default, require:
 - equivalent Mimi encoder codes at the boundary;
 - equivalent decoded boundary audio and no first-frame discontinuity;
 - exact ledger cursor after a concurrently produced final delta;
-- repeated A→B→A ping-pong installs without reconnecting;
-- no meaningful regression in active p50/p95/p99 or deadline misses;
 - substantially lower `M + W` preparation latency than the sequential
-  reference across realistic sequence lengths.
+  reference.
+
+Repeated A→B→A soak runs, real WebSocket audio inspection, memory-use quality,
+and full-duplex behavioral preservation remain required before a paper claim.
 
 ## Evidence and limitations
 
@@ -205,6 +198,20 @@ installation against an 80 ms frame budget, with a 0.25% deadline-miss rate in
 threaded ablation exceeded the deadline at p95 and produced CUDA/stream-state
 problems, so one OS process per PersonaPlex GPU remains a correctness boundary.
 
-These measurements establish live-path isolation and cheap handoff. They do
-not measure batched `M + W` prefill, and they do not yet establish perceptual
-audio seamlessness or memory-conditioned behavioral quality.
+New A40 process-isolated measurements are in
+[`../benchmarks/batched_prefill_2026-09-01.json`](../benchmarks/batched_prefill_2026-09-01.json).
+At 64 frames, batched duplex prefill was 3.96× faster than sequential forcing;
+at 256 frames it was 4.10× faster. Total role-memory-plus-duplex preparation
+improved by 2.03× and 2.76×, respectively. Both lengths had zero user-code,
+forced-target, or decoder mismatches, and their next assistant target and PCM
+matched the sequential oracle exactly.
+
+The live gateway completed a swap in 15.42 s with one final-delta frame and a
+59.1 ms critical section. Active p95 during installation was 64.49 ms. Most of
+the remaining readiness time came from waiting for the reset Mimi encoder to
+produce 16 consecutive codes matching the active encoder. Thus the principal
+next systems task is pre-cutoff codec-state restoration, not LM tail replay.
+
+These measurements establish the batched state transition, live-path
+isolation, and cheap handoff. They do not yet establish perceptual audio
+seamlessness or memory-conditioned behavioral quality.
