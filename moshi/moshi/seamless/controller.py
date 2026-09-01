@@ -19,6 +19,7 @@ from .types import (
     CompactResult,
     ControllerConfig,
     ControllerPhase,
+    InstallBackend,
     ReplayResult,
     StepResult,
     SwapRecord,
@@ -46,27 +47,34 @@ EventSink = Callable[[dict[str, Any]], Any]
 
 
 class SeamlessInstallController:
-    """Keep the live model responsive while rebuilding its peer in parallel.
+    """Install memory through one of exactly two PersonaPlex backends.
 
-    There is exactly one serialization point: ``_step_lock``. Normal active
-    inference holds it for one codec frame. Installation does not hold it
-    during compaction or batched ``M+W`` prefill; it acquires it only for the
-    final (normally tiny) delta prefill and pointer swap.
+    ``shadow`` keeps live inference responsive while a second resident slot
+    rebuilds ``M+W``. ``inplace`` uses one resident slot and deliberately
+    holds ``_step_lock`` for the batched prefill that replaces its state.
     """
 
     def __init__(
         self,
-        slots: tuple[PersonaPlexSlot, PersonaPlexSlot],
+        slots: tuple[PersonaPlexSlot, ...],
         memory_worker: MemoryWorker,
         *,
         config: ControllerConfig | None = None,
         event_sink: EventSink | None = None,
     ) -> None:
-        if slots[0].name == slots[1].name:
-            raise ValueError("active and shadow slots must have distinct names")
+        self.config = config or ControllerConfig()
+        expected_slots = (
+            2 if self.config.install_backend is InstallBackend.SHADOW else 1
+        )
+        if len(slots) != expected_slots:
+            raise ValueError(
+                f"{self.config.install_backend.value} install requires exactly "
+                f"{expected_slots} PersonaPlex slot(s), got {len(slots)}"
+            )
+        if len({slot.name for slot in slots}) != len(slots):
+            raise ValueError("PersonaPlex slots must have distinct names")
         self.slots = slots
         self.memory_worker = memory_worker
-        self.config = config or ControllerConfig()
         self.ledger = DuplexFrameLedger(self.config.ledger_max_frames)
         self._event_sink = event_sink
         self._events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -84,6 +92,7 @@ class SeamlessInstallController:
         self._last_trigger_seq = -1
         self._last_error: str | None = None
         self._last_swap: SwapRecord | None = None
+        self._active_state_valid = True
         self._memory_healthy = True
         self.phase = ControllerPhase.IDLE
 
@@ -93,7 +102,15 @@ class SeamlessInstallController:
 
     @property
     def shadow_slot(self) -> PersonaPlexSlot:
+        if self.config.install_backend is not InstallBackend.SHADOW:
+            raise RuntimeError("inplace install has no shadow slot")
         return self.slots[1 - self._active_index]
+
+    @property
+    def _install_slot(self) -> PersonaPlexSlot:
+        if self.config.install_backend is InstallBackend.SHADOW:
+            return self.shadow_slot
+        return self.active_slot
 
     @property
     def session_id(self) -> str | None:
@@ -122,6 +139,7 @@ class SeamlessInstallController:
         self._last_trigger_seq = -1
         self._last_error = None
         self._last_swap = None
+        self._active_state_valid = True
         self._memory_healthy = True
         self.ledger.reset()
         self._frame_advanced.clear()
@@ -129,21 +147,17 @@ class SeamlessInstallController:
         try:
             await self.memory_worker.start_session(session_id, self._role_prompt)
             memory_started = True
-            # Prime both resident processes with the role and voice. The
-            # shadow will be reset with memory at install time, but its voice
-            # embedding is then cached and does not inflate first-handoff
-            # latency by several seconds.
+            # Shadow mode primes both resident processes. Inplace mode owns
+            # exactly one slot and primes only that process.
             await asyncio.gather(
-                self.active_slot.start_session(
-                    self._role_prompt,
-                    voice_prompt,
-                    self.config.text_prefill_chunk_tokens,
-                ),
-                self.shadow_slot.start_session(
-                    self._role_prompt,
-                    voice_prompt,
-                    self.config.text_prefill_chunk_tokens,
-                ),
+                *(
+                    slot.start_session(
+                        self._role_prompt,
+                        voice_prompt,
+                        self.config.text_prefill_chunk_tokens,
+                    )
+                    for slot in self.slots
+                )
             )
         except Exception:
             if memory_started:
@@ -155,6 +169,7 @@ class SeamlessInstallController:
         await self._emit(
             "session_started",
             session_id=session_id,
+            install_backend=self.config.install_backend.value,
             active_slot=self.active_slot.name,
         )
 
@@ -258,8 +273,9 @@ class SeamlessInstallController:
             request_id=request_id,
             reason=reason,
             cutoff_hint_seq=cutoff,
+            install_backend=self.config.install_backend.value,
             active_slot=self.active_slot.name,
-            shadow_slot=self.shadow_slot.name,
+            install_slot=self._install_slot.name,
         )
         return True
 
@@ -270,7 +286,10 @@ class SeamlessInstallController:
         return self._last_swap
 
     async def close_session(self) -> None:
-        if self.phase in (ControllerPhase.IDLE, ControllerPhase.CLOSED):
+        if (
+            self.phase in (ControllerPhase.IDLE, ControllerPhase.CLOSED)
+            and self._session_id is None
+        ):
             return
         self._session_generation += 1
         if self._install_task is not None and not self._install_task.done():
@@ -302,13 +321,19 @@ class SeamlessInstallController:
                 "prefilled_through_seq": self._last_swap.prefilled_through_seq,
                 "forced_boundary": self._last_swap.forced_boundary,
                 "request_id": self._last_swap.request_id,
+                "backend": self._last_swap.backend,
                 "timings": self._last_swap.timings,
             }
         return {
             "phase": self.phase.value,
             "session_id": self._session_id,
+            "install_backend": self.config.install_backend.value,
             "active_slot": self.active_slot.name,
-            "shadow_slot": self.shadow_slot.name,
+            "shadow_slot": (
+                self.shadow_slot.name
+                if self.config.install_backend is InstallBackend.SHADOW
+                else None
+            ),
             "memory_version": self._memory_version,
             "memory_chars": len(self._memory),
             "memory_sha256": (
@@ -323,7 +348,10 @@ class SeamlessInstallController:
             "install_running": install_running,
             "last_error": self._last_error,
             "memory_worker_healthy": self._memory_healthy,
-            "last_swap": swap,
+            "last_swap": (
+                swap if self.config.install_backend is InstallBackend.SHADOW else None
+            ),
+            "last_install": swap,
         }
 
     def drain_events(self) -> list[dict[str, Any]]:
@@ -363,11 +391,16 @@ class SeamlessInstallController:
         except Exception as exc:
             self._last_error = f"{type(exc).__name__}: {exc}"
             if self.phase != ControllerPhase.CLOSED:
-                self.phase = ControllerPhase.ACTIVE
+                self.phase = (
+                    ControllerPhase.ACTIVE
+                    if self._active_state_valid
+                    else ControllerPhase.CLOSED
+                )
             await self._emit(
                 "install_failed",
                 request_id=request_id,
                 error=self._last_error,
+                active_state_valid=self._active_state_valid,
             )
         finally:
             if pinned:
@@ -397,6 +430,16 @@ class SeamlessInstallController:
         )
         self._validate_compaction(compact, request_id, cutoff_hint)
         self._require_generation(generation)
+
+        if self.config.install_backend is InstallBackend.INPLACE:
+            await self._run_inplace_install(
+                generation=generation,
+                compact=compact,
+                reason=reason,
+                install_started=install_started,
+                compact_wall_s=compact_wall_s,
+            )
+            return
 
         self.phase = ControllerPhase.PREFILLING
         await self._emit(
@@ -485,6 +528,165 @@ class SeamlessInstallController:
                     return
             await self._wait_for_next_frame_or_boundary_timer(ready_at)
 
+    async def _run_inplace_install(
+        self,
+        *,
+        generation: int,
+        compact: CompactResult,
+        reason: str,
+        install_started: float,
+        compact_wall_s: float,
+    ) -> None:
+        """Replace the sole active state under one deliberate long pause."""
+
+        self.phase = ControllerPhase.CATCHING_UP
+        ready_at: float | None = None
+        forced_boundary = False
+        required_tail = max(
+            self.config.inplace_min_tail_frames,
+            self.config.codec_convergence_frames,
+            self.config.decoder_convergence_frames,
+        )
+        while True:
+            self._require_generation(generation)
+            tail_frames = self.ledger.latest_seq - compact.cutoff_seq
+            if tail_frames >= required_tail:
+                if ready_at is None:
+                    ready_at = time.perf_counter()
+                    self.phase = ControllerPhase.READY
+                    await self._emit(
+                        "install_inplace_ready",
+                        request_id=compact.request_id,
+                        tail_frames=tail_frames,
+                    )
+                safe = self.ledger.is_safe_boundary(
+                    self.config.safe_silence_frames,
+                    self.config.silence_rms_threshold,
+                )
+                forced_boundary = (
+                    time.perf_counter() - ready_at >= self.config.force_switch_after_s
+                )
+                if safe or forced_boundary:
+                    break
+            await self._wait_for_next_frame_or_boundary_timer(ready_at)
+
+        lock_requested = time.perf_counter()
+        slot = self.active_slot
+        async with self._step_lock:
+            lock_acquired = time.perf_counter()
+            self._require_generation(generation)
+            latest = self.ledger.latest_seq
+            self.phase = ControllerPhase.PREFILLING
+            await self._emit(
+                "install_prefill_started",
+                request_id=compact.request_id,
+                install_backend=InstallBackend.INPLACE.value,
+                install_slot=slot.name,
+                cutoff_seq=compact.cutoff_seq,
+                through_seq=latest,
+            )
+
+            # From this point the former active cache has been destructively
+            # replaced. A failure must close the session rather than continue
+            # from a partially rebuilt state.
+            self._active_state_valid = False
+            prefill_started = time.perf_counter()
+            await slot.start_session(
+                self._compose_installed_prompt(compact.memory),
+                self._voice_prompt,
+                self.config.text_prefill_chunk_tokens,
+            )
+            prefill_wall_s = time.perf_counter() - prefill_started
+
+            duplex_prefill_started = time.perf_counter()
+            prefilled_through = compact.cutoff_seq
+            codec_match_run = 0
+            decoder_match_run = 0
+            if prefilled_through < latest:
+                (
+                    prefilled_through,
+                    codec_match_run,
+                    decoder_match_run,
+                ) = await self._prefill_available(
+                    slot,
+                    prefilled_through,
+                    codec_match_run,
+                    decoder_match_run,
+                    compact.request_id,
+                )
+            duplex_prefill_wall_s = time.perf_counter() - duplex_prefill_started
+
+            codec_converged = codec_match_run >= self.config.codec_convergence_frames
+            decoder_converged = (
+                decoder_match_run >= self.config.decoder_convergence_frames
+            )
+            if not codec_converged or not decoder_converged:
+                await self._emit(
+                    "install_inplace_state_mismatch",
+                    request_id=compact.request_id,
+                    codec_match_run=codec_match_run,
+                    codec_required=self.config.codec_convergence_frames,
+                    decoder_match_run=decoder_match_run,
+                    decoder_required=self.config.decoder_convergence_frames,
+                )
+
+            self._memory_version += 1
+            self._memory = compact.memory.strip()
+            self._last_cutoff_seq = compact.cutoff_seq
+            self._last_error = None
+            completed_at = time.perf_counter()
+            interruption_s = completed_at - lock_acquired
+            timings = {
+                "trigger_to_install_s": completed_at - install_started,
+                "trigger_to_swap_s": completed_at - install_started,
+                "compaction_s": compact_wall_s,
+                "prefill_s": prefill_wall_s,
+                "duplex_prefill_s": duplex_prefill_wall_s,
+                "safe_boundary_wait_s": (
+                    0.0 if ready_at is None else max(0.0, lock_requested - ready_at)
+                ),
+                "step_lock_wait_s": lock_acquired - lock_requested,
+                "final_delta_prefill_s": 0.0,
+                "critical_section_s": interruption_s,
+                "interruption_s": interruption_s,
+                "final_delta_frames": 0.0,
+                "codec_match_run": float(codec_match_run),
+                "decoder_match_run": float(decoder_match_run),
+                "codec_converged": float(codec_converged),
+                "decoder_converged": float(decoder_converged),
+            }
+            self._last_swap = SwapRecord(
+                version=self._memory_version,
+                old_active=slot.name,
+                new_active=slot.name,
+                cutoff_seq=compact.cutoff_seq,
+                prefilled_through_seq=prefilled_through,
+                forced_boundary=forced_boundary,
+                memory=self._memory,
+                request_id=compact.request_id,
+                backend=InstallBackend.INPLACE.value,
+                timings=timings,
+            )
+            self._active_state_valid = True
+            self.phase = ControllerPhase.ACTIVE
+
+        await self._emit(
+            "install_completed",
+            request_id=compact.request_id,
+            reason=reason,
+            install_backend=InstallBackend.INPLACE.value,
+            version=self._memory_version,
+            active_slot=slot.name,
+            cutoff_seq=compact.cutoff_seq,
+            prefilled_through_seq=prefilled_through,
+            forced_boundary=forced_boundary,
+            codec_match_run=codec_match_run,
+            decoder_match_run=decoder_match_run,
+            codec_converged=codec_converged,
+            decoder_converged=decoder_converged,
+            timings=timings,
+        )
+
     async def _obtain_compaction(
         self,
         *,
@@ -539,7 +741,7 @@ class SeamlessInstallController:
 
     async def _prefill_available(
         self,
-        shadow: PersonaPlexSlot,
+        slot: PersonaPlexSlot,
         prefilled_through: int,
         codec_match_run: int,
         decoder_match_run: int,
@@ -550,7 +752,7 @@ class SeamlessInstallController:
         while start <= latest:
             end = min(start + self.config.prefill_batch_frames, latest + 1)
             batch = self.ledger.slice(start, end)
-            prefill = await shadow.prefill_duplex(batch)
+            prefill = await slot.prefill_duplex(batch)
             self._require_exact_target_prefill(prefill)
             codec_match_run = self._updated_codec_match_run(codec_match_run, prefill)
             decoder_match_run = self._updated_decoder_match_run(
@@ -630,7 +832,9 @@ class SeamlessInstallController:
             self._last_cutoff_seq = compact.cutoff_seq
             self._last_error = None
             swapped_at = time.perf_counter()
+            interruption_s = swapped_at - lock_acquired
             timings = {
+                "trigger_to_install_s": swapped_at - install_started,
                 "trigger_to_swap_s": swapped_at - install_started,
                 "compaction_s": compact_wall_s,
                 "prefill_s": prefill_wall_s,
@@ -640,7 +844,8 @@ class SeamlessInstallController:
                 ),
                 "step_lock_wait_s": lock_acquired - lock_requested,
                 "final_delta_prefill_s": final_delta_prefill_wall_s,
-                "critical_section_s": swapped_at - lock_acquired,
+                "critical_section_s": interruption_s,
+                "interruption_s": interruption_s,
                 "final_delta_frames": float(final_delta_frames),
             }
             self._last_swap = SwapRecord(
@@ -652,6 +857,7 @@ class SeamlessInstallController:
                 forced_boundary=forced_boundary,
                 memory=self._memory,
                 request_id=compact.request_id,
+                backend=InstallBackend.SHADOW.value,
                 timings=timings,
             )
             self.phase = ControllerPhase.ACTIVE
@@ -729,7 +935,7 @@ class SeamlessInstallController:
     def _require_exact_target_prefill(prefill: ReplayResult) -> None:
         if prefill.target_mismatches:
             raise RuntimeError(
-                "shadow duplex prefill diverged: "
+                "duplex prefill diverged: "
                 f"target={prefill.target_mismatches}, "
                 f"range={prefill.start_seq}:{prefill.end_seq}"
             )

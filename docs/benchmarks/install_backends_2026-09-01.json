@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-01",
+  "scope": "PersonaPlex shadow and inplace memory-install backend validation",
+  "hardware": "NVIDIA A40 48 GB",
+  "runtime": {
+    "partition": "vram48",
+    "qos": "q-high-sehun.lee",
+    "prefill_batch_frames": 64,
+    "text_prefill_chunk_tokens": 64
+  },
+  "shadow": {
+    "source_job": 1370881,
+    "personaplex_gpus": 2,
+    "completed": true,
+    "cutoff_seq": 46,
+    "prefilled_through_seq": 239,
+    "trigger_to_install_s": 15.4195,
+    "role_memory_prefill_s": 3.1307,
+    "duplex_prefill_s": 9.2933,
+    "interruption_s": 0.0591,
+    "final_delta_frames": 1,
+    "active_during_install_p95_ms": 64.4899,
+    "active_deadline_miss_rate": 0.00518,
+    "codec_match_run": 16,
+    "decoder_match_run": 47,
+    "codec_converged": true,
+    "decoder_converged": true
+  },
+  "inplace": {
+    "source_job": 1371196,
+    "personaplex_gpus": 1,
+    "completed": true,
+    "cutoff_seq": 46,
+    "prefilled_through_seq": 302,
+    "raw_tail_frames": 256,
+    "trigger_to_install_s": 27.9279,
+    "tail_accumulation_s": 20.48,
+    "role_memory_prefill_s": 3.1488,
+    "duplex_prefill_s": 4.3804,
+    "interruption_s": 7.5292,
+    "active_during_install_p95_ms": 69.2406,
+    "active_max_ms_including_pause": 7584.749,
+    "active_deadline_miss_rate": 0.00390625,
+    "codec_match_run": 0,
+    "decoder_match_run": 139,
+    "codec_converged": false,
+    "decoder_converged": true,
+    "first_post_install_seq": 303,
+    "post_install_step_completed": true
+  },
+  "comparison_limit": "These validation runs do not use identical W lengths: shadow installed through seq 239 while inplace deliberately accumulated 256 raw-tail frames through seq 302. Use the benchmark's backend flag with a fixed cutoff and W for a controlled paper comparison.",
+  "measurement_cost": {
+    "openai_api_usd": 0.0,
+    "allocated_gpu_hours_this_change_including_diagnostics": 0.0839,
+    "cumulative_allocated_gpu_hours_including_prior_batched_prefill_work": 0.27,
+    "gpu_jobs": [1371153, 1371157, 1371165, 1371169, 1371184, 1371196]
+  }
+}

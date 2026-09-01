@@ -1,4 +1,4 @@
-"""PersonaPlex WebDemo gateway with asynchronous active/shadow installation."""
+"""PersonaPlex WebDemo gateway with shadow or inplace memory installation."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from .seamless.model_slot import (
     PersonaPlexSlotEngine,
     ProcessPersonaPlexSlot,
 )
-from .seamless.types import ControllerConfig
+from .seamless.types import ControllerConfig, InstallBackend
 from .utils.connection import create_ssl_context, get_lan_ip
 
 
@@ -78,12 +78,12 @@ def _get_static_path(static: str | None) -> str | None:
 
 
 class SeamlessWebState:
-    """Own one browser socket and route it between two resident GPU slots."""
+    """Own one browser socket across either supported install backend."""
 
     def __init__(
         self,
         *,
-        slots: tuple[Any, Any],
+        slots: tuple[Any, ...],
         controller: SeamlessInstallController,
         voice_prompt_dir: str,
         sample_rate: int,
@@ -320,7 +320,7 @@ class SeamlessWebState:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Two-GPU PersonaPlex gateway with async memory installation"
+        description="PersonaPlex gateway with shadow or inplace memory installation"
     )
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8998)
@@ -331,8 +331,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--moshi-weight")
     parser.add_argument("--mimi-weight")
     parser.add_argument("--voice-prompt-dir")
+    parser.add_argument(
+        "--install-backend",
+        choices=tuple(backend.value for backend in InstallBackend),
+        default=InstallBackend.SHADOW.value,
+        help=(
+            "shadow: two PersonaPlex GPUs and atomic handoff; "
+            "inplace: one PersonaPlex GPU and a blocking batched M+W prefill"
+        ),
+    )
     parser.add_argument("--active-device", default="cuda:1")
-    parser.add_argument("--shadow-device", default="cuda:2")
+    parser.add_argument(
+        "--shadow-device",
+        default="cuda:2",
+        help="second PersonaPlex device used only by --install-backend shadow",
+    )
     parser.add_argument(
         "--slot-runtime",
         choices=("process", "thread"),
@@ -360,6 +373,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--text-prefill-chunk-tokens", type=int, default=64)
+    parser.add_argument(
+        "--inplace-min-tail-frames",
+        type=int,
+        default=256,
+        help=(
+            "minimum raw W accumulated after the compact cutoff before a "
+            "destructive inplace prefill"
+        ),
+    )
     parser.add_argument("--switch-max-lag-frames", type=int, default=2)
     parser.add_argument("--safe-silence-frames", type=int, default=3)
     parser.add_argument("--silence-rms-threshold", type=float, default=0.004)
@@ -383,7 +405,10 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args = _build_parser().parse_args()
-    if args.active_device == args.shadow_device:
+    if (
+        args.install_backend == InstallBackend.SHADOW.value
+        and args.active_device == args.shadow_device
+    ):
         raise ValueError("active-device and shadow-device must be different")
     seed_all(42424242, include_cuda=args.slot_runtime == "thread")
 
@@ -399,10 +424,12 @@ def main() -> None:
     )
 
     async def make_app() -> web.Application:
-        slot_specs = (
-            ("slot-a", args.active_device),
-            ("slot-b", args.shadow_device),
-        )
+        slot_specs = (("slot-a", args.active_device),)
+        if args.install_backend == InstallBackend.SHADOW.value:
+            slot_specs = (
+                *slot_specs,
+                ("slot-b", args.shadow_device),
+            )
         if args.slot_runtime == "process":
             slots = tuple(
                 ProcessPersonaPlexSlot(
@@ -442,10 +469,7 @@ def main() -> None:
                         decoder_mse_threshold=args.decoder_mse_threshold,
                     )
                 )
-            slots = (
-                AsyncPersonaPlexSlot(engines[0]),
-                AsyncPersonaPlexSlot(engines[1]),
-            )
+            slots = tuple(AsyncPersonaPlexSlot(engine) for engine in engines)
             # CUDA graph capture is process-global, so threaded startup must
             # serialize first capture even though the devices differ.
             for slot in slots:
@@ -461,10 +485,12 @@ def main() -> None:
             else NullMemoryWorker()
         )
         config = ControllerConfig(
+            install_backend=args.install_backend,
             context_capacity_frames=args.context_capacity_frames,
             trigger_reserve_frames=args.trigger_reserve_frames,
             prefill_batch_frames=args.prefill_batch_frames,
             text_prefill_chunk_tokens=args.text_prefill_chunk_tokens,
+            inplace_min_tail_frames=args.inplace_min_tail_frames,
             switch_max_lag_frames=args.switch_max_lag_frames,
             safe_silence_frames=args.safe_silence_frames,
             silence_rms_threshold=args.silence_rms_threshold,
@@ -507,12 +533,19 @@ def main() -> None:
         args.host if args.host not in ("0.0.0.0", "::", "localhost") else get_lan_ip()
     )
     logger.info("WebDemo: %s://%s:%d", protocol, host_ip, args.port)
-    logger.info(
-        "GPU routing: memory=%s active=%s shadow=%s",
-        args.memory_worker_url or "manual",
-        args.active_device,
-        args.shadow_device,
-    )
+    if args.install_backend == InstallBackend.SHADOW.value:
+        logger.info(
+            "GPU routing: backend=shadow memory=%s active=%s shadow=%s",
+            args.memory_worker_url or "manual",
+            args.active_device,
+            args.shadow_device,
+        )
+    else:
+        logger.info(
+            "GPU routing: backend=inplace memory=%s active=%s",
+            args.memory_worker_url or "manual",
+            args.active_device,
+        )
     if args.control_token is None and args.host not in ("localhost", "127.0.0.1"):
         logger.warning(
             "manual install endpoint has no --control-token on a non-local host"

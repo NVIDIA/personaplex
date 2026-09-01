@@ -36,6 +36,24 @@ and the critical section was 59.1 ms. Active p95 during installation was
 Transformer prefill. The sequential replay-rate model below is retained only
 as the historical baseline.
 
+The runtime now exposes exactly two architectures: two-PersonaPlex-GPU
+`shadow` and one-PersonaPlex-GPU `inplace`. A first A40 system validation is in
+[`benchmarks/install_backends_2026-09-01.json`](benchmarks/install_backends_2026-09-01.json).
+
+| backend | PP GPUs | trigger to install | blocking interruption | prefix | duplex prefill | final codec convergence |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `shadow` | 2 | 15.42 s | 59.1 ms | 3.13 s | 9.29 s | yes, 16 frames |
+| `inplace` | 1 | 27.93 s | 7.53 s | 3.15 s | 4.38 s | no, 0 frames |
+
+The inplace run accumulated a 256-frame (20.48 s) raw tail before reset,
+installed memory successfully, and completed frame 303 after resuming. Its
+decoder matched for 139 frames, but its reset Mimi encoder did not match at the
+final boundary. This is why `inplace` is a resource-efficient baseline, not a
+seamless system. These two validation runs used different `W` lengths, so their
+prefill times are not a controlled speed comparison. Peak VRAM, perceptual
+audio discontinuity, and a fixed-`W` head-to-head run remain outstanding. See
+[`adr/0002-two-install-backends.md`](adr/0002-two-install-backends.md).
+
 ## Measurement scope
 
 - Two NVIDIA A40 48 GB GPUs on one `vram48` node.

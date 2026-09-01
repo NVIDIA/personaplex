@@ -20,14 +20,23 @@ class ControllerPhase(str, Enum):
     CLOSED = "closed"
 
 
+class InstallBackend(str, Enum):
+    """The two supported PersonaPlex state-installation architectures."""
+
+    SHADOW = "shadow"
+    INPLACE = "inplace"
+
+
 @dataclass(slots=True)
 class ControllerConfig:
     """Runtime policy, expressed in PersonaPlex codec frames."""
 
+    install_backend: InstallBackend | str = InstallBackend.SHADOW
     context_capacity_frames: int = 3000
     trigger_reserve_frames: int = 1400
     prefill_batch_frames: int = 64
     text_prefill_chunk_tokens: int = 64
+    inplace_min_tail_frames: int = 256
     switch_max_lag_frames: int = 2
     safe_silence_frames: int = 3
     silence_rms_threshold: float = 0.004
@@ -40,6 +49,11 @@ class ControllerConfig:
     memory_heading: str = "conversation_memory"
 
     def __post_init__(self) -> None:
+        try:
+            self.install_backend = InstallBackend(self.install_backend)
+        except ValueError as exc:
+            choices = ", ".join(backend.value for backend in InstallBackend)
+            raise ValueError(f"install_backend must be one of: {choices}") from exc
         if self.context_capacity_frames <= 0:
             raise ValueError("context_capacity_frames must be positive")
         if not 0 < self.trigger_reserve_frames < self.context_capacity_frames:
@@ -48,6 +62,8 @@ class ControllerConfig:
             raise ValueError("prefill_batch_frames must be positive")
         if self.text_prefill_chunk_tokens <= 0:
             raise ValueError("text_prefill_chunk_tokens must be positive")
+        if self.inplace_min_tail_frames < 0:
+            raise ValueError("inplace_min_tail_frames cannot be negative")
         if self.switch_max_lag_frames < 0:
             raise ValueError("switch_max_lag_frames cannot be negative")
         if self.safe_silence_frames < 0:
@@ -164,6 +180,7 @@ class SwapRecord:
     forced_boundary: bool
     memory: str
     request_id: str
+    backend: str = InstallBackend.SHADOW.value
     timings: dict[str, float] = field(default_factory=dict)
 
     @property

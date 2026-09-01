@@ -12,6 +12,7 @@ from moshi.seamless.types import (
     CompactResult,
     ControllerConfig,
     DuplexFrame,
+    InstallBackend,
     ReplayResult,
     StepResult,
 )
@@ -135,12 +136,16 @@ class BlockingMemoryWorker:
         del session_id
 
 
-def test_config() -> ControllerConfig:
+def test_config(
+    install_backend: InstallBackend | str = InstallBackend.SHADOW,
+) -> ControllerConfig:
     return ControllerConfig(
+        install_backend=install_backend,
         context_capacity_frames=8,
         trigger_reserve_frames=5,
         prefill_batch_frames=2,
         text_prefill_chunk_tokens=2,
+        inplace_min_tail_frames=0,
         switch_max_lag_frames=0,
         safe_silence_frames=1,
         force_switch_after_s=0.05,
@@ -152,6 +157,22 @@ def test_config() -> ControllerConfig:
 
 
 class SeamlessControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_shadow_and_inplace_slot_layouts_are_accepted(self) -> None:
+        slot_a = FakeSlot("slot-a")
+        slot_b = FakeSlot("slot-b")
+        with self.assertRaisesRegex(ValueError, "shadow install requires exactly 2"):
+            SeamlessInstallController(
+                (slot_a,), NullMemoryWorker(), config=test_config("shadow")
+            )
+        with self.assertRaisesRegex(ValueError, "inplace install requires exactly 1"):
+            SeamlessInstallController(
+                (slot_a, slot_b),
+                NullMemoryWorker(),
+                config=test_config("inplace"),
+            )
+        with self.assertRaisesRegex(ValueError, "install_backend must be one of"):
+            test_config("unsupported")
+
     async def test_active_inference_continues_during_compaction_then_swaps(
         self,
     ) -> None:
@@ -210,6 +231,110 @@ class SeamlessControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.active_slot.name, "slot-a")
         self.assertEqual(swap.version, 2)
         self.assertIn("Memory v2", slot_a.prompts[-1])
+        await controller.close_session()
+
+    async def test_inplace_install_keeps_one_slot_and_prefills_batched_tail(
+        self,
+    ) -> None:
+        active = FakeSlot("gpu-2", replay_delay=0.001)
+        memory = BlockingMemoryWorker()
+        controller = SeamlessInstallController(
+            (active,), memory, config=test_config(InstallBackend.INPLACE)
+        )
+        await controller.start_session(
+            session_id="single-gpu",
+            role_prompt="Be helpful.",
+            voice_prompt="voice.pt",
+        )
+
+        for _ in range(3):
+            await controller.process_pcm(np.zeros(4, dtype=np.float32))
+        await asyncio.wait_for(memory.compact_started.wait(), timeout=0.5)
+
+        # Compaction is still asynchronous; only the later in-place prefill
+        # is a stop-the-world section on the active PersonaPlex slot.
+        await controller.process_pcm(np.zeros(4, dtype=np.float32))
+        self.assertEqual(active.active_seqs, [0, 1, 2, 3])
+        memory.release.set()
+
+        record = await controller.wait_for_install()
+        self.assertIsNotNone(record)
+        self.assertEqual(record.backend, "inplace")
+        self.assertEqual(record.old_active, "gpu-2")
+        self.assertEqual(record.new_active, "gpu-2")
+        self.assertEqual(active.prefilled_seqs, [3])
+        self.assertIn("conversation_memory", active.prompts[-1])
+        self.assertGreaterEqual(record.timings["interruption_s"], 0)
+
+        status = controller.status()
+        self.assertEqual(status["install_backend"], "inplace")
+        self.assertIsNone(status["shadow_slot"])
+        self.assertIsNone(status["last_swap"])
+        self.assertEqual(status["last_install"]["backend"], "inplace")
+
+        await controller.process_pcm(np.zeros(4, dtype=np.float32))
+        self.assertEqual(active.active_seqs[-1], 4)
+        await controller.close_session()
+
+    async def test_inplace_prefill_failure_closes_destructively_reset_session(
+        self,
+    ) -> None:
+        class FailingPrefillSlot(FakeSlot):
+            async def prefill_duplex(self, frames: list[DuplexFrame]) -> ReplayResult:
+                del frames
+                raise RuntimeError("prefill failed")
+
+        active = FailingPrefillSlot("only-slot")
+        controller = SeamlessInstallController(
+            (active,),
+            NullMemoryWorker(),
+            config=test_config(InstallBackend.INPLACE),
+        )
+        await controller.start_session(
+            session_id="failed-inplace",
+            role_prompt="Role",
+            voice_prompt="voice.pt",
+        )
+        for _ in range(3):
+            await controller.process_pcm(np.zeros(4, dtype=np.float32))
+
+        await controller.request_install(memory="Memory", cutoff_seq=0)
+        self.assertIsNone(await controller.wait_for_install())
+        self.assertEqual(controller.status()["phase"], "closed")
+        self.assertIn("prefill failed", controller.status()["last_error"])
+        with self.assertRaisesRegex(RuntimeError, "no active"):
+            await controller.process_pcm(np.zeros(4, dtype=np.float32))
+
+        await controller.close_session()
+        self.assertIsNone(controller.session_id)
+
+    async def test_inplace_codec_mismatch_is_reported_without_third_backend(
+        self,
+    ) -> None:
+        config = test_config(InstallBackend.INPLACE)
+        config.codec_convergence_frames = 2
+        config.decoder_convergence_frames = 0
+        active = FakeSlot("only-slot", codec_mismatch_seqs={3})
+        controller = SeamlessInstallController(
+            (active,), NullMemoryWorker(), config=config
+        )
+        await controller.start_session(
+            session_id="inplace-mismatch",
+            role_prompt="Role",
+            voice_prompt="voice.pt",
+        )
+        for _ in range(4):
+            await controller.process_pcm(np.zeros(4, dtype=np.float32))
+
+        await controller.request_install(memory="Memory", cutoff_seq=0)
+        record = await controller.wait_for_install()
+        self.assertIsNotNone(record)
+        self.assertEqual(record.timings["codec_converged"], 0.0)
+        self.assertEqual(controller.status()["memory_version"], 1)
+        self.assertIn(
+            "install_inplace_state_mismatch",
+            {event["event"] for event in controller.drain_events()},
+        )
         await controller.close_session()
 
     async def test_wrong_compactor_cutoff_never_replaces_active_slot(self) -> None:

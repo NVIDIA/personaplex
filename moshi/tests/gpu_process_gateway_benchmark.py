@@ -1,4 +1,4 @@
-"""Measure the production process-isolated seamless gateway on two GPUs."""
+"""Measure either production process-isolated install backend."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from moshi.models import loaders
 from moshi.seamless.controller import SeamlessInstallController
 from moshi.seamless.memory import NullMemoryWorker
 from moshi.seamless.model_slot import ProcessPersonaPlexSlot
-from moshi.seamless.types import ControllerConfig
+from moshi.seamless.types import ControllerConfig, InstallBackend
 
 
 FRAME_RATE = 12.5
@@ -61,6 +61,8 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     tokenizer = hf_hub_download(args.hf_repo, loaders.TEXT_TOKENIZER_NAME)
     archive = Path(hf_hub_download(args.hf_repo, "voices.tgz"))
     voice = str(archive.parent / "voices" / args.voice)
+    install_backend = InstallBackend(args.install_backend)
+    slot_count = 2 if install_backend is InstallBackend.SHADOW else 1
     slots = tuple(
         ProcessPersonaPlexSlot(
             name=f"slot-{index}",
@@ -69,9 +71,9 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             moshi_weight=moshi,
             tokenizer_path=tokenizer,
             process_rank=index,
-            process_world_size=2,
+            process_world_size=slot_count,
         )
-        for index in range(2)
+        for index in range(slot_count)
     )
     startup_started = time.perf_counter()
     try:
@@ -79,10 +81,12 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         startup_s = time.perf_counter() - startup_started
         pcm = load_pcm(args.input_audio, slots[0].sample_rate)
         config = ControllerConfig(
+            install_backend=install_backend,
             context_capacity_frames=3000,
             trigger_reserve_frames=256,
             prefill_batch_frames=64,
             text_prefill_chunk_tokens=64,
+            inplace_min_tail_frames=args.inplace_min_tail_frames,
             switch_max_lag_frames=2,
             safe_silence_frames=0,
             force_switch_after_s=0,
@@ -110,9 +114,16 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         requested = False
         max_frames = int(args.timeout_s * FRAME_RATE)
         for seq in range(max_frames):
+            if controller.phase.value == "closed":
+                break
             phase = controller.phase.value
             started = time.perf_counter()
-            await controller.process_pcm(audio_frame(pcm, seq, slots[0].frame_size))
+            try:
+                await controller.process_pcm(audio_frame(pcm, seq, slots[0].frame_size))
+            except RuntimeError:
+                if controller.phase.value == "closed":
+                    break
+                raise
             rows.append(
                 {
                     "seq": seq,
@@ -122,7 +133,8 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             )
             if seq + 1 == args.install_at_frame:
                 requested = await controller.request_install(
-                    memory="Customer preference | project = Aurora | status = current"
+                    memory="Customer preference | project = Aurora | status = current",
+                    cutoff_seq=args.cutoff_seq,
                 )
             if requested and controller.status()["memory_version"] == 1:
                 break
@@ -143,7 +155,8 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         await controller.close_session()
         return {
             "schema_version": 1,
-            "method": "production process-isolated controller RPC",
+            "method": "production process-isolated install controller RPC",
+            "install_backend": install_backend.value,
             "devices": [slot.device_name for slot in slots],
             "startup_s": startup_s,
             "session_start_s": session_start_s,
@@ -163,16 +176,30 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hf-repo", default=loaders.DEFAULT_REPO)
+    parser.add_argument(
+        "--install-backend",
+        choices=tuple(backend.value for backend in InstallBackend),
+        default=InstallBackend.SHADOW.value,
+    )
     parser.add_argument("--voice", default="NATF2.pt")
     parser.add_argument(
         "--input-audio", type=Path, default=Path("assets/test/input_service.wav")
     )
     parser.add_argument("--install-at-frame", type=int, default=48)
+    parser.add_argument(
+        "--cutoff-seq",
+        type=int,
+        help="optional fixed compact cutoff for identical-W backend comparisons",
+    )
+    parser.add_argument("--inplace-min-tail-frames", type=int, default=256)
     parser.add_argument("--timeout-s", type=float, default=30)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if torch.cuda.device_count() < 2:
-        raise RuntimeError("two visible GPUs are required")
+    required_gpus = 2 if args.install_backend == InstallBackend.SHADOW.value else 1
+    if torch.cuda.device_count() < required_gpus:
+        raise RuntimeError(
+            f"{args.install_backend} requires {required_gpus} visible GPU(s)"
+        )
     report = asyncio.run(run(args))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
