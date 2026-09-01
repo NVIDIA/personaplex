@@ -12,12 +12,20 @@ browser WebSocket ──> persistent gateway ──> slot A / GPU 2 (active)
 The two PersonaPlex checkpoints are loaded once and remain resident in separate
 OS processes. Process isolation is required because a shared Python/CUDA
 process caused CUDA-graph interference and active-stream deadline misses in the
-two-GPU benchmark. A compact
-trigger never unloads or blocks the active checkpoint. GPU 1 builds a cumulative
-memory at an exact committed frame cutoff; the inactive PersonaPlex receives
-that memory as a new system prefix, replays the post-cutoff duplex tail, catches
-up, and becomes active by an in-process pointer swap. The former active slot is
-then the shadow for the next installation.
+two-GPU benchmark. A compact trigger never unloads or blocks the active
+checkpoint. GPU 1 builds cumulative memory `M` at an exact committed frame
+cutoff. The inactive PersonaPlex prepares a replacement state from the new
+prefix and the known aligned duplex suffix `W`, catches the small delta created
+during preparation, and becomes active by an in-process pointer swap. The
+former active slot is then the shadow for the next installation.
+
+The target data plane treats `[role, M, W]` as one logical batched prefill. The
+current branch still advances `W` with teacher-forced one-frame LM steps because
+upstream `LMGen` only exposes an `S=1` generation path. This is a correctness
+reference rather than the intended performance optimization; it does not
+autoregressively regenerate the conversation. The decision, cost model, exact
+implementation boundary, and batched-prefill acceptance tests are recorded in
+[`adr/0001-active-shadow-seamless-install.md`](adr/0001-active-shadow-seamless-install.md).
 
 This is intentionally a gateway, not a reverse proxy. Opus reader/writer state,
 the browser WebSocket, frame numbering, and playback remain owned by one
@@ -31,11 +39,14 @@ process across every swap.
 2. **Exact cutoff.** GPU 1 must return the requested `cutoff_hint_seq` exactly.
    A different cutoff is rejected so no evidence is lost or represented in
    both compact memory and the raw tail.
-3. **Exact duplex replay.** The ledger stores each user PCM frame, its eight
+3. **Exact duplex prefill.** The ledger stores each user PCM frame, its eight
    active Mimi codes, and the active model's target-position text plus eight
-   assistant codes. The shadow teacher-forces the target cache directly. Using
-   `LMGen.step(..., moshi_tokens=...)` here would be incorrect because that API
-   applies codebook delays again.
+   assistant codes. `W` is known observed context, so the shadow teacher-forces
+   it rather than sampling it. The current reference implementation forces each
+   target cache position directly; the target implementation performs the same
+   state transition as a batched sequence prefill. Using
+   `LMGen.step(..., moshi_tokens=...)` naively would be incorrect because that
+   API applies codebook delays again.
 4. **Codec convergence.** Tail PCM advances the shadow Mimi encoder and the
    forced assistant codes advance its decoder. Initial states may differ
    because pre-cutoff acoustics were discarded; the swap is withheld until
@@ -179,7 +190,7 @@ curl -X POST http://127.0.0.1:8998/api/seamless/install \
   -d '{}'
 ```
 
-Thus **when** to compact can change without changing the writer, replay, or
+Thus **when** to compact can change without changing the writer, prefill, or
 atomic installation mechanism.
 
 ## What is and is not validated
@@ -199,9 +210,11 @@ PYTHONPATH=moshi python moshi/tests/gpu_seamless_smoke.py
 
 An end-to-end claim still requires a two-PersonaPlex-GPU soak test plus the
 actual GPU-1 ASR/compactor service. Report at least active-frame p50/p95/p99,
-shadow replay RTF, catch-up lag, switch pause, audio discontinuity, exact target
-replay mismatches, Mimi convergence length, memory correctness, and unchanged
-full-duplex behavior before treating the installation as seamless.
+`M+W` prefill latency by sequence length, effective prefill throughput, final
+delta size, switch pause, audio discontinuity, exact target mismatches, Mimi
+boundary-state equivalence, memory correctness, and unchanged full-duplex
+behavior before treating the installation as seamless. Replay RTF remains
+useful only for the current sequential reference path.
 
 The current A40 measurements, catch-up equation, provisional trigger reserve,
 and known bottlenecks are documented in

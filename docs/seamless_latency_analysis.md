@@ -8,6 +8,12 @@ the current shadow preparation is too slow to call the overall system mature.**
 Raw summary values are in
 [`benchmarks/seamless_latency_2026-09-01.json`](benchmarks/seamless_latency_2026-09-01.json).
 
+> **Interpretation update.** These measurements use the branch's sequential
+> teacher-forced tail path. They validate active/shadow process isolation and a
+> cheap atomic handoff, but they are not measurements of the intended batched
+> `[role, M, W]` prefill. The target design and migration boundary are recorded
+> in [`adr/0001-active-shadow-seamless-install.md`](adr/0001-active-shadow-seamless-install.md).
+
 ## Measurement scope
 
 - Two NVIDIA A40 48 GB GPUs on one `vram48` node.
@@ -65,7 +71,7 @@ code, forced-target, or decoder mismatches. The same check failed in the shared
 process, which confirms that isolation is a correctness requirement here, not
 only a latency optimization.
 
-## Why catch-up amplifies every upstream second
+## Why the current sequential reference amplifies every upstream second
 
 Let:
 
@@ -85,7 +91,9 @@ T_ready = (C + P) + f(C + P)/(R - f)
 ```
 
 For the manual run, `C=0` predicts 31.58 s, close to the observed 31.98 s. This
-agreement makes the model useful for provisional capacity planning.
+agreement makes the model useful for provisional capacity planning of the
+current implementation only. A true batched `M+W` prefill must be measured as a
+new path; the replay-rate equation must not be carried over to it.
 
 The prior 24-condition compactor artifact has mean 6.325 s and p95 6.743 s.
 Combining it with this gateway gives:
@@ -134,11 +142,11 @@ trigger**; it must be measured in the real GPU-1 service.
    audio to wash out the discarded causal Mimi state. A state-only acoustic
    pre-roll, or an explicit encoder/decoder state snapshot, should be prepared
    without reintroducing pre-cutoff facts into the LM context.
-3. **Raise replay throughput.** Bulk replay currently performs per-frame CPU
-   validation and transfers. Accumulating user-code, target, and decoder checks
-   on GPU and synchronizing once per batch is the first systems optimization to
-   test. The objective is substantial margin over 12.5 frames/s, not merely
-   `RTF < 1`.
+3. **Implement batched duplex prefill.** The current tail path performs
+   per-frame LM stepping, validation, and transfers. Add a delay-correct
+   `prefill_duplex()` that advances the Transformer cache over sequence chunks
+   while preserving LMGen's token ring and Mimi boundary state. Retain the
+   sequential path as the equivalence oracle and rollback mode.
 4. **Measure the actual third GPU.** Implement and deploy streaming ASR plus the
    compactor contract, then report ASR watermark lag, compaction p95, and true
    trigger-to-swap together.

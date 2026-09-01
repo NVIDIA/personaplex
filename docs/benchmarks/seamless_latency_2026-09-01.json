@@ -2,6 +2,12 @@
   "schema_version": 1,
   "date": "2026-09-01",
   "scope": "PersonaPlex asynchronous memory-install system latency",
+  "interpretation": {
+    "measured_tail_path": "sequential teacher-forced frame stepping",
+    "validated_claim": "process-isolated active/shadow preparation preserves the live path and permits a cheap pointer handoff",
+    "not_measured": "target batched [role, memory M, aligned duplex suffix W] prefill",
+    "design_record": "../adr/0001-active-shadow-seamless-install.md"
+  },
   "production_gateway": {
     "slurm_job": 1369867,
     "hardware": ["NVIDIA A40", "NVIDIA A40"],
