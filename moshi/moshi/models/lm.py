@@ -110,14 +110,21 @@ def create_sinewave(duration: float, sample_rate: int) -> np.ndarray:
 
 
 def normalize_audio(wav: np.ndarray, sr: int, target_lufs: float) -> np.ndarray:
-    """Normalize **mono** audio to a target LUFS level."""
+    """Normalize audio to a target LUFS level.
+
+    ``wav`` is channels-first, as returned by ``load_audio``: ``(T,)`` or
+    ``(C, T)``. pyloudnorm expects ``(samples,)`` or ``(samples, channels)``,
+    so multi-channel input is metered transposed while the gain is applied to
+    the original layout.
+    """
     import pyloudnorm as pyln
     # Ensure shape is (T,)
     if wav.ndim == 2 and wav.shape[0] == 1:
         wav = wav[0]
 
+    meter_input = wav.T if wav.ndim == 2 else wav
     meter = pyln.Meter(sr)
-    loudness = meter.integrated_loudness(wav)
+    loudness = meter.integrated_loudness(meter_input)
     return pyln.normalize.loudness(wav, loudness, target_lufs)
 
 
