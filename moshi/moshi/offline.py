@@ -169,6 +169,9 @@ def run_inference(
     greedy: bool,
     save_voice_prompt_embeddings: bool,
     cpu_offload: bool = False,
+    prefill_system_prompt: bool = True,
+    pin_system_prompt: bool = True,
+    max_pinned_frames: int = 512,
 ):
     """Run offline inference using an input WAV as the user-side stream.
 
@@ -221,6 +224,9 @@ def run_inference(
         temp_text=temp_text,
         top_k=topk_audio,
         top_k_text=topk_text,
+        prefill_system_prompt=prefill_system_prompt,
+        pin_system_prompt=pin_system_prompt,
+        max_pinned_frames=max_pinned_frames,
     )
     # Keep models in streaming mode similar to the server
     mimi.streaming_forever(1)
@@ -381,6 +387,18 @@ def main():
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
     parser.add_argument("--seed", type=int, default=-1, help="Seed for reproducibility (-1 disables)")
+    parser.add_argument(
+        "--prefill-system-prompt", action=argparse.BooleanOptionalAction, default=True,
+        help="Compute the system prompt KV cache in one batched pass instead of frame by frame.",
+    )
+    parser.add_argument(
+        "--pin-system-prompt", action=argparse.BooleanOptionalAction, default=True,
+        help="Keep the system prompt (voice + text) in the KV cache for the whole conversation.",
+    )
+    parser.add_argument(
+        "--max-pinned-frames", type=int, default=512,
+        help="Largest system prompt that can be pinned, in frames (12.5 per second).",
+    )
 
     args = parser.parse_args()
 
@@ -424,6 +442,9 @@ def main():
             greedy=greedy,
             save_voice_prompt_embeddings=False,
             cpu_offload=args.cpu_offload,
+            prefill_system_prompt=args.prefill_system_prompt,
+            pin_system_prompt=args.pin_system_prompt,
+            max_pinned_frames=args.max_pinned_frames,
         )
 
 

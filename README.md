@@ -7,6 +7,8 @@
 
 PersonaPlex is a real-time, full-duplex speech-to-speech conversational model that enables persona control through text-based role prompts and audio-based voice conditioning. Trained on a combination of synthetic and real conversations, it produces natural, low-latency spoken interactions with a consistent persona. PersonaPlex is based on the [Moshi](https://arxiv.org/abs/2410.00037) architecture and weights.
 
+**NEW:** the system prompt (voice + text) now stays in the model's context for the whole conversation instead of dropping out of context. The prompt also acts as the attention sink. This enabled endless stable conversations while preserving voice and role. However, conversation memory is still limited to a sliding window of the last ~2.5 minutes ((2048-system_prompt_frames)/12.5). Also the system prompt is loaded in one prefill instead of stepping though token-by-token. Both are on by default; see [Endless Conversations](#endless-conversations).
+
 <p align="center">
   <img src="assets/architecture_diagram.png" alt="PersonaPlex Model Architecture">
   <br>
@@ -62,6 +64,19 @@ Access the Web UI from a browser at `localhost:8998` if running locally, otherwi
 ```
 Access the Web UI directly at https://11.54.401.33:8998
 ```
+
+### Endless Conversations
+
+PersonaPlex attends to a context of 2048 frames. The server and offline script now keep the system prompt pinned in that context for the whole conversation, and compute it in a single pass at the start of each session. Both `moshi.server` and `moshi.offline` accept:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--pin-system-prompt` / `--no-pin-system-prompt` | on | Keep the system prompt in context for the whole conversation; the rest of the context keeps sliding. |
+| `--prefill-system-prompt` / `--no-prefill-system-prompt` | on | Load the system prompt in one batched pass instead of frame by frame. |
+| `--max-pinned-frames` | 512 | Longest system prompt that can be pinned, in frames (12.5 per second). Set it to the longest system prompt that you would expect the server to encounter. There is no issue if the system prompt is shorter than this value.|
+
+Each session logs the prompt length, for example `Pinned 176 system prompt frames (max_pinned_frames=512, sliding window 2824 frames)`. A prompt takes 12.5 frames per second of voice prompt plus one per text token, plus 11; set `--max-pinned-frames` a little above your longest prompt. Pinned frames come out of the 2048-frame window. `python -m moshi.bench_pinning` measures the overhead on your GPU.
+
 
 ### Offline Evaluation
 

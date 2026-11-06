@@ -101,7 +101,7 @@ _lm_kwargs = {
     "hidden_scale": 4.125,
     "causal": True,
     "layer_scale": None,
-    "context": 3000,
+    "context": 2048,
     "max_period": 10000,
     "gating": "silu",
     "norm": "rms_norm_f32",

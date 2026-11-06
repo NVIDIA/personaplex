@@ -32,6 +32,7 @@ See `StreamingTransformer` for more information.
 
 from contextlib import ExitStack
 from dataclasses import dataclass
+import math
 import typing as tp
 
 from einops import rearrange
@@ -39,7 +40,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from ..utils.compile import no_compile
+from ..utils.compile import no_compile, torch_compile_lazy
 from .gating import make_gating
 from .rope import RotaryEmbedding
 from .streaming import StreamingModule, StreamingContainer
@@ -216,6 +217,52 @@ def set_attention_context(model: nn.Module, context: tp.Optional[int] = None) ->
             module.context = context
 
 
+def enable_kv_prefix_pinning(model: nn.Module, max_pinned: int) -> int:
+    """Make the causal RoPE self-attention layers of `model` use a `PinnedRingKVCache`.
+
+    Must be called before streaming starts (`streaming()` / `streaming_forever()`), because the
+    cache type is chosen when the streaming state is created. Layers without RoPE, without a
+    finite context, or with per-step weights (e.g. the depformer) are left untouched.
+
+    Returns:
+        The number of attention layers that will pin.
+    """
+    count = 0
+    for module in model.modules():
+        if (
+            isinstance(module, StreamingMultiheadAttention)
+            and module.rope is not None
+            and module.causal
+            and module.context is not None
+            and not module.weights_per_step
+        ):
+            if module._streaming_state is not None:
+                raise RuntimeError(
+                    "enable_kv_prefix_pinning must be called before streaming starts."
+                )
+            module.kv_pin_max = max_pinned
+            count += 1
+    return count
+
+
+def pin_kv_prefix(model: nn.Module, n: int) -> int:
+    """Pin the first `n` cached frames in every `PinnedRingKVCache` of `model`.
+
+    Call outside CUDA graph capture, right after the prefix has been written.
+
+    Returns:
+        The number of attention layers that were pinned.
+    """
+    count = 0
+    for module in model.modules():
+        if isinstance(module, StreamingMultiheadAttention):
+            state = module._streaming_state
+            if state is not None and isinstance(state.kv_cache, PinnedRingKVCache):
+                state.kv_cache.pin(n)
+                count += 1
+    return count
+
+
 class KVCacheResult(tp.NamedTuple):
     keys: torch.Tensor
     values: torch.Tensor
@@ -302,9 +349,206 @@ class RingKVCache:
         return {"cache": self.cache, "end_offset": self.end_offset}
 
 
+def _rotate_rope_keys(x: torch.Tensor, shift: torch.Tensor, max_period: float) -> torch.Tensor:
+    """Move RoPE-encoded vectors forward by `shift` positions.
+
+    `x` must already carry RoPE exactly as written by `apply_rope` (interleaved (real, imag)
+    pairs on the last dimension, layout [B, H, T, D]). RoPE is a per-pair rotation, so rotating
+    a key that was encoded at position p by `shift` yields the key encoded at p + shift; no
+    un-rotated copy is needed. The frequencies are computed exactly as in `apply_rope`, and the
+    angle is reduced modulo 2*pi in float64 so that very large shifts keep full precision.
+
+    Compiled lazily like `apply_rope`, so the elementwise ops are fused into a few kernels
+    (set NO_TORCH_COMPILE=1 to run it eagerly).
+
+    Args:
+        x: tensor of shape [B, H, T, D].
+        shift: long tensor with one element. It may live on the device, so this function can be
+            captured in a CUDA graph with a shift that changes at every replay.
+        max_period: the `max_period` of the RotaryEmbedding that encoded `x`.
+    """
+    B, H, T, D = x.shape
+    assert D % 2 == 0
+    ds = torch.arange(D // 2, device=x.device, dtype=torch.float32)
+    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
+    angle = torch.remainder(freqs.double() * shift.double(), 2 * math.pi)
+    rotr = torch.cos(angle).float()
+    roti = torch.sin(angle).float()
+
+    xp = x.view(B, H, T, D // 2, 2)
+    xr = xp[..., 0].float()
+    xi = xp[..., 1].float()
+    outr = xr * rotr - xi * roti
+    outi = xr * roti + xi * rotr
+    return torch.stack([outr.to(x.dtype), outi.to(x.dtype)], dim=-1).view(B, H, T, D)
+
+
+rotate_rope_keys = torch_compile_lazy(_rotate_rope_keys)
+
+
+@torch_compile_lazy
+def _reencode_pinned_prefix(
+    pinned_keys: torch.Tensor,
+    head: torch.Tensor,
+    n: torch.Tensor,
+    shift: torch.Tensor,
+    pin_slots: torch.Tensor,
+    max_period: float,
+) -> torch.Tensor:
+    """New content for the first `max_pinned` key slots: the pinned keys moved by `shift` in
+    slots < n, and the current content everywhere else. Fused into one kernel when compiled."""
+    rotated = _rotate_rope_keys(pinned_keys, shift, max_period)
+    keep = (pin_slots < n).view(1, 1, -1, 1)
+    return torch.where(keep, rotated, head)
+
+
+class PinnedRingKVCache:
+    """Streaming KV cache whose first `n` entries (e.g. a system prompt) are never evicted.
+
+    The `capacity` slots are split in two once `pin(n)` has been called:
+
+    * slots [0, n): the pinned prefix. At every step its keys are re-encoded from a saved copy so
+      that the prefix always sits immediately before the oldest remaining ring entry, i.e. at
+      positions [E - capacity, E - capacity + n) once the ring has wrapped, where E is the number
+      of frames seen so far. Every pinned key therefore stays within `capacity - 1` of the newest
+      query: inside the attention context and inside the distance range seen in training. Before
+      the ring wraps the shift is 0, so nothing differs from an ordinary cache.
+    * slots [n, capacity): a FIFO ring holding the most recent `capacity - n` entries at their
+      true positions.
+
+    Values carry no positional information and are never modified after being written.
+
+    With n == 0 (after construction or `reset()`) the cache returns exactly what `RingKVCache`
+    returns, positions included, so it can be swapped in without changing any result until `pin`
+    is called.
+
+    Everything that runs per step uses device tensors and static shapes, so `complete` can be
+    captured in a CUDA graph; `n` lives on the device and may change between sessions without
+    re-capturing. The per-step cost of re-encoding is proportional to `max_pinned` (not `n`),
+    because shapes must stay static for the graph. Only `pin` synchronizes with the host, and it
+    must be called outside graph capture.
+
+    Args:
+        batch_size, num_heads, dim_per_head, capacity, device, dtype: as for `RingKVCache`.
+        max_pinned (int): largest prefix that can be pinned; must be smaller than `capacity`.
+        max_period (float): `max_period` of the RotaryEmbedding used by the attention.
+    """
+
+    def __init__(
+        self,
+        batch_size: int,
+        num_heads: int,
+        dim_per_head: int,
+        capacity: int,
+        max_pinned: int,
+        max_period: float,
+        device: torch.device = torch.device("cuda"),
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        if not 0 < max_pinned < capacity:
+            raise ValueError(
+                f"max_pinned must be in (0, capacity={capacity}), got {max_pinned}."
+            )
+        self.capacity = capacity
+        self.max_pinned = max_pinned
+        self.max_period = max_period
+        self.cache = torch.zeros(
+            (2, batch_size, num_heads, capacity, dim_per_head),
+            device=device,
+            dtype=dtype,
+        )
+        self.end_offset = torch.zeros(1, device=device, dtype=torch.long)
+        self.pinned_n = torch.zeros(1, device=device, dtype=torch.long)
+        # Keys of the pinned prefix as encoded at their original positions 0..n-1.
+        self.pinned_keys = torch.zeros(
+            (batch_size, num_heads, max_pinned, dim_per_head),
+            device=device,
+            dtype=dtype,
+        )
+        self._slots = torch.arange(capacity, device=device, dtype=torch.long)
+        self._pin_slots = torch.arange(max_pinned, device=device, dtype=torch.long)
+
+    def reset(self):
+        self.end_offset.zero_()
+        self.pinned_n.zero_()
+
+    @torch.no_grad()
+    def pin(self, n: int) -> None:
+        """Pin the first `n` entries. Call right after they were written, before the ring wraps.
+
+        Synchronizes with the host, so it must not be called during CUDA graph capture.
+        """
+        n = int(n)
+        end = int(self.end_offset.item())
+        if n < 0 or n > self.max_pinned:
+            raise ValueError(
+                f"Cannot pin {n} frames: at most {self.max_pinned} can be pinned "
+                "(raise max_pinned / --max-pinned-frames)."
+            )
+        if n > end:
+            raise ValueError(f"Cannot pin {n} frames, only {end} have been written.")
+        if end > self.capacity:
+            raise ValueError(
+                "pin() must be called before the cache wraps around, while the first "
+                f"entries are still present (end_offset={end}, capacity={self.capacity})."
+            )
+        if n == 0:
+            self.pinned_n.zero_()
+            return
+        self.pinned_keys[:, :, :n].copy_(self.cache[0, :, :, :n])
+        self.pinned_n.fill_(n)
+
+    def complete(self, k: torch.Tensor, v: torch.Tensor) -> KVCacheResult:
+        assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
+        B, H, T, D = k.shape
+        n = self.pinned_n
+        ring = self.capacity - n
+
+        # Write the new entries. With n == 0 this is `abs_pos % capacity`, as in RingKVCache.
+        abs_pos = torch.arange(T, device=self.end_offset.device, dtype=torch.long) + self.end_offset
+        slots = torch.where(abs_pos < n, abs_pos, n + torch.remainder(abs_pos - n, ring))
+        self.cache[0].index_copy_(2, slots, k)
+        self.cache[1].index_copy_(2, slots, v)
+        self.end_offset.add_(T)
+        end = self.end_offset
+
+        # Re-encode the pinned prefix right before the oldest ring entry (no-op when n == 0).
+        shift = torch.clamp(end - self.capacity, min=0)
+        head = self.cache[0, :, :, : self.max_pinned]
+        head.copy_(_reencode_pinned_prefix(
+            self.pinned_keys, head, n, shift, self._pin_slots, self.max_period))
+
+        # Positions exactly as RingKVCache computes them (used while nothing is pinned).
+        all_slots = self._slots
+        end_index = end % self.capacity
+        delta = all_slots - end_index
+        legacy = torch.where(delta <= 0, end + delta, end + delta - self.capacity)
+        legacy = torch.where(all_slots >= end, torch.full_like(legacy, -1), legacy)
+
+        # Positions with a pinned prefix: the newest ring entry has ring-relative index
+        # `last_rel`; slot s holds the largest ring-relative index <= last_rel congruent to s - n.
+        last_rel = end - 1 - n
+        rel = last_rel - torch.remainder(last_rel - (all_slots - n), ring)
+        ring_pos = torch.where(
+            (all_slots >= n) & (rel >= 0), n + rel, torch.full_like(rel, -1)
+        )
+        pinned_pos = torch.where(all_slots < n, all_slots + shift, ring_pos)
+
+        positions = torch.where(n > 0, pinned_pos, legacy)
+        return KVCacheResult(self.cache[0], self.cache[1], positions)
+
+    def asdict(self):
+        return {
+            "cache": self.cache,
+            "end_offset": self.end_offset,
+            "pinned_n": self.pinned_n,
+            "pinned_keys": self.pinned_keys,
+        }
+
+
 @dataclass
 class _MHAState:
-    kv_cache: RingKVCache
+    kv_cache: tp.Union[RingKVCache, PinnedRingKVCache]
     offset: torch.Tensor
     offset_cpu: int
 
@@ -332,6 +576,9 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
     """
 
     _fsdp_final = True
+    # When > 0, streaming allocates a PinnedRingKVCache that can pin up to this many frames.
+    # Set it with `enable_kv_prefix_pinning` before streaming starts.
+    kv_pin_max: int = 0
 
     def __init__(
         self,
@@ -381,9 +628,18 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         # TODO: the following estimation will not work great with FSDP.
         dtype = self.in_proj_weight.dtype
         dim_per_head = self.embed_dim // self.num_heads
-        kv_cache = RingKVCache(
-            batch_size, self.num_heads, dim_per_head, capacity, device, dtype
-        )
+        kv_cache: tp.Union[RingKVCache, PinnedRingKVCache]
+        if self.kv_pin_max > 0:
+            assert self.rope is not None, "KV prefix pinning requires RoPE."
+            kv_cache = PinnedRingKVCache(
+                batch_size, self.num_heads, dim_per_head, capacity,
+                max_pinned=self.kv_pin_max, max_period=self.rope.max_period,
+                device=device, dtype=dtype,
+            )
+        else:
+            kv_cache = RingKVCache(
+                batch_size, self.num_heads, dim_per_head, capacity, device, dtype
+            )
         return _MHAState(
             kv_cache,
             offset=torch.zeros(1, device=device, dtype=torch.long),

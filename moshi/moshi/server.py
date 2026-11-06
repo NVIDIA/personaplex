@@ -96,7 +96,10 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False,
+                 prefill_system_prompt: bool = True,
+                 pin_system_prompt: bool = True,
+                 max_pinned_frames: int = 512):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -109,6 +112,9 @@ class ServerState:
                             device=device,
                             frame_rate=self.mimi.frame_rate,
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
+                            prefill_system_prompt=prefill_system_prompt,
+                            pin_system_prompt=pin_system_prompt,
+                            max_pinned_frames=max_pinned_frames,
         )
         
         self.lock = asyncio.Lock()
@@ -391,6 +397,19 @@ def main():
         )
     )
 
+    parser.add_argument(
+        "--prefill-system-prompt", action=argparse.BooleanOptionalAction, default=True,
+        help="Compute the system prompt KV cache in one batched pass instead of frame by frame.",
+    )
+    parser.add_argument(
+        "--pin-system-prompt", action=argparse.BooleanOptionalAction, default=True,
+        help="Keep the system prompt (voice + text) in the KV cache for the whole conversation.",
+    )
+    parser.add_argument(
+        "--max-pinned-frames", type=int, default=512,
+        help="Largest system prompt that can be pinned, in frames (12.5 per second).",
+    )
+
     args = parser.parse_args()
     args.voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
@@ -453,6 +472,9 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        prefill_system_prompt=args.prefill_system_prompt,
+        pin_system_prompt=args.pin_system_prompt,
+        max_pinned_frames=args.max_pinned_frames,
     )
     logger.info("warming up the model")
     state.warmup()

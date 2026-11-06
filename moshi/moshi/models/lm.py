@@ -45,8 +45,11 @@ from ..utils.sampling import sample_token
 from ..utils.compile import CUDAGraphed
 from ..modules.streaming import StreamingStateDict, StreamingContainer, StreamingModule, load_streaming_state
 from ..modules.transformer import (
+    StreamingMultiheadAttention,
     StreamingTransformer,
     create_norm_fn,
+    enable_kv_prefix_pinning,
+    pin_kv_prefix,
 )
 
 logger = logging.getLogger(__name__)
@@ -661,7 +664,27 @@ class LMGen(StreamingModule[_LMGenState]):
         save_voice_prompt_embeddings: bool = False,
         sample_rate: int = 32000,
         frame_rate: int = FRAME_RATE_HZ,
+        prefill_system_prompt: bool = False,
+        pin_system_prompt: bool = False,
+        max_pinned_frames: int = 512,
+        prefill_chunk_size: int = 512,
     ):
+        """
+        Args (system prompt handling):
+            prefill_system_prompt: compute the KV cache of the whole system prompt (voice prompt,
+                silences, text prompt) in one batched transformer pass instead of stepping it
+                frame by frame. The cache, token buffers and offsets end up the same as with
+                stepping (up to floating point); the only behavioral difference is that the
+                prompt no longer consumes random numbers, so seeded sampling afterwards differs.
+            pin_system_prompt: keep the system prompt's KV entries for the whole conversation.
+                The rest of the context keeps sliding, over `context - prompt_frames` frames,
+                and the pinned keys are re-encoded every step so they stay right before the
+                oldest remaining frame. Must be decided here, before streaming starts.
+            max_pinned_frames: largest system prompt (in frames, 12.5 per second) that can be
+                pinned. The per-step re-encoding cost scales with this value, not with the
+                actual prompt length, because shapes must be static for CUDA graphs.
+            prefill_chunk_size: maximum number of frames per transformer call during prefill.
+        """
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
 
@@ -698,6 +721,19 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_cache: Optional[torch.Tensor] = None
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
         #self.voice_prompt_mimi_streaming_state: Optional[StreamingStateDict] = None
+        self.prefill_system_prompt = prefill_system_prompt
+        self.pin_system_prompt = pin_system_prompt
+        self.max_pinned_frames = max_pinned_frames
+        self.prefill_chunk_size = prefill_chunk_size
+        # Number of KV frames written by the most recent system prompt.
+        self.system_prompt_frames: int = 0
+        if pin_system_prompt:
+            n_layers = enable_kv_prefix_pinning(lm_model.transformer, max_pinned_frames)
+            if n_layers == 0:
+                raise RuntimeError(
+                    "pin_system_prompt=True but the main transformer has no causal RoPE "
+                    "attention layer with a finite context."
+                )
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
@@ -1115,16 +1151,160 @@ class LMGen(StreamingModule[_LMGenState]):
                 break
 
     async def step_system_prompts_async(self, mimi, is_alive: Optional[Callable]=None):
-        await self._step_voice_prompt_async(mimi, is_alive)
-        await self._step_audio_silence_async(is_alive)
-        await self._step_text_prompt_async(is_alive)
-        await self._step_audio_silence_async(is_alive)
+        if self.prefill_system_prompt:
+            if is_alive is not None and not await is_alive():
+                return
+            frames = self._prefill_system_prompts(mimi)
+        else:
+            await self._step_voice_prompt_async(mimi, is_alive)
+            await self._step_audio_silence_async(is_alive)
+            await self._step_text_prompt_async(is_alive)
+            await self._step_audio_silence_async(is_alive)
+            frames = self._kv_frames()
+        self._finish_system_prompts(frames)
 
     def step_system_prompts(self, mimi):
-        self._step_voice_prompt(mimi)
-        self._step_audio_silence()
-        self._step_text_prompt()
-        self._step_audio_silence()
+        if self.prefill_system_prompt:
+            frames = self._prefill_system_prompts(mimi)
+        else:
+            self._step_voice_prompt(mimi)
+            self._step_audio_silence()
+            self._step_text_prompt()
+            self._step_audio_silence()
+            frames = self._kv_frames()
+        self._finish_system_prompts(frames)
+
+    # ------------------------------------------------------------------
+    # System prompt prefill and pinning
+
+    def _kv_frames(self) -> int:
+        """Number of frames written to the main transformer's KV cache so far."""
+        for module in self.lm_model.transformer.modules():
+            if isinstance(module, StreamingMultiheadAttention) and module._streaming_state is not None:
+                return int(module._streaming_state.offset.item())
+        return 0
+
+    def _finish_system_prompts(self, frames: int) -> None:
+        self.system_prompt_frames = frames
+        if self.pin_system_prompt:
+            pin_kv_prefix(self.lm_model.transformer, frames)
+            print(
+                f'Pinned {frames} system prompt frames '
+                f'(max_pinned_frames={self.max_pinned_frames}, '
+                f'sliding window {self.lm_model.context - frames} frames).'
+            )
+        else:
+            print(f'System prompt: {frames} frames (not pinned).')
+
+    @torch.no_grad()
+    def _advance_forced_frame(self, input_tokens, moshi_tokens, text_token) -> Optional[torch.Tensor]:
+        """Advance the token/delay bookkeeping for one system-prompt frame exactly like `step`,
+        without running the transformer or the depformer.
+
+        During the system prompt every stream (text, agent audio, user audio) is forced, so
+        whatever the model samples is discarded by `process_transformer_output`; the only state
+        that function changes is `provided` and `offset`, which is mirrored here. Returns the
+        transformer input tokens for this frame, [B, K, 1], or None for the very first frame,
+        which only seeds the delay buffer and feeds nothing to the transformer.
+        """
+        state = self._streaming_state
+        prepared = self.prepare_step_input(input_tokens, moshi_tokens, text_token)
+        if prepared is None:
+            return None
+        input_, provided_, _, model_input_position, _ = prepared
+        # If a target stream were not forced, `step` would write a sampled token into the delay
+        # buffer and later inputs would depend on the model: the prompt could not be prefilled.
+        self._prefill_all_forced &= provided_.all()
+        input_ = input_.clone()  # this delay-buffer column is overwritten a few frames later
+        state.provided[:, :, model_input_position] = False
+        state.offset += 1
+        return input_
+
+    @torch.no_grad()
+    def _advance_embedding_frame(self) -> None:
+        """Bookkeeping equivalent of `step_embeddings` (used for stored voice prompts)."""
+        lm_model = self.lm_model
+        needed_input_tokens = lm_model.num_codebooks - AUDIO_TOKENS_PER_STREAM - 1
+        dummy = lm_model._get_initial_token()
+        while True:
+            input_ = self._advance_forced_frame(
+                dummy[:, 1:1 + needed_input_tokens],
+                dummy[:, 1 + needed_input_tokens:],
+                self.zero_text_code,
+            )
+            if input_ is not None:
+                return
+
+    @torch.no_grad()
+    def _collect_system_prompt_embeddings(self, mimi) -> list[torch.Tensor]:
+        """Run the system-prompt bookkeeping and return the transformer inputs ([B, 1, D] each),
+        in exactly the order `step_system_prompts` would feed them."""
+        lm_model = self.lm_model
+        state = self._streaming_state
+        embeddings: list[torch.Tensor] = []
+
+        def forced(moshi_tokens: torch.Tensor, text_token) -> None:
+            input_ = self._advance_forced_frame(self._encode_sine_frame(), moshi_tokens, text_token)
+            if input_ is not None:
+                embeddings.append(lm_model.embed_codes(input_))
+
+        # 1) Voice prompt.
+        if self.voice_prompt_embeddings is not None:
+            for embedding in self.voice_prompt_embeddings:
+                self._advance_embedding_frame()
+                embeddings.append(embedding)
+            state.cache.copy_(self.voice_prompt_cache)
+        elif self.voice_prompt_audio is not None:
+            first = len(embeddings)
+            for voice_prompt_frame_tokens in self._encode_voice_prompt_frames(mimi):
+                forced(voice_prompt_frame_tokens, self.zero_text_code)
+            if self.save_voice_prompt_embeddings:
+                torch.save(
+                    {
+                        "embeddings": torch.stack(embeddings[first:], dim=0).detach().cpu(),
+                        "cache": state.cache,
+                    },
+                    splitext(self.voice_prompt)[0] + ".pt",
+                )
+        # 2) Silence, 3) text prompt, 4) silence.
+        for _ in range(self.audio_silence_frame_cnt):
+            forced(self._encode_zero_frame(), self.zero_text_code)
+        for text_prompt_token in self.text_prompt_tokens or []:
+            forced(self._encode_zero_frame(), text_prompt_token)
+        for _ in range(self.audio_silence_frame_cnt):
+            forced(self._encode_zero_frame(), self.zero_text_code)
+        return embeddings
+
+    @torch.no_grad()
+    def _prefill_system_prompts(self, mimi) -> int:
+        """Write the whole system prompt into the KV cache with batched transformer calls.
+
+        Returns the number of KV frames written.
+        """
+        state = self._streaming_state
+        if state is None:
+            raise RuntimeError(
+                "You should wrap those calls with a `with lm_gen.streaming(): ...`."
+            )
+        if state.offset != 0 or self._kv_frames() != 0:
+            raise RuntimeError("System prompt prefill requires a freshly reset stream.")
+        self._prefill_all_forced = torch.ones((), dtype=torch.bool, device=self.lm_model.device)
+        embeddings = self._collect_system_prompt_embeddings(mimi)
+        if not bool(self._prefill_all_forced.item()):
+            raise RuntimeError(
+                "A system prompt frame left a stream unforced, so it cannot be prefilled exactly."
+            )
+        if embeddings:
+            x = torch.cat(embeddings, dim=1)  # [B, T, D]
+            chunk = self.prefill_chunk_size if self.prefill_chunk_size > 0 else x.shape[1]
+            for start in range(0, x.shape[1], chunk):
+                # The text head and depformer are skipped: their outputs would be discarded.
+                self.lm_model.transformer(x[:, start:start + chunk])
+        frames = self._kv_frames()
+        if frames != len(embeddings):
+            raise RuntimeError(f"Prefill wrote {frames} KV frames, expected {len(embeddings)}.")
+        print(f'Prefilled {frames} system prompt frames in one pass.')
+        return frames
 
     def depformer_step(
         self,
