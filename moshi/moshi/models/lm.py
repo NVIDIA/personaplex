@@ -1130,7 +1130,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 break
 
     def _step_text_prompt_core(self) -> Iterator[None]:
-        for text_prompt_token in self.text_prompt_tokens:
+        for text_prompt_token in self.text_prompt_tokens or []:
             yield
             self.step(
                 moshi_tokens=self._encode_zero_frame(),
