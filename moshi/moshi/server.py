@@ -47,7 +47,7 @@ import random
 
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
-from .utils.connection import create_ssl_context, get_lan_ip
+from .utils.connection import create_ssl_context, get_lan_ip, query_seed
 from .utils.logging import setup_logger, ColorizedLog
 
 
@@ -174,7 +174,7 @@ class ServerState:
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
-        seed = int(request["seed"]) if "seed" in request.query else None
+        seed = query_seed(request)
 
         async def recv_loop():
             nonlocal close

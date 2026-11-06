@@ -29,6 +29,20 @@ from .logging import setup_logger
 
 logger = setup_logger(__name__)
 
+
+def query_seed(request):
+    """Return the optional integer seed from the request query string.
+
+    Query parameters live on ``request.query``; ``request[key]`` only looks up
+    path (match_info) parameters, so reading ``request["seed"]`` raises
+    ``KeyError`` whenever a client passes ``?seed=`` in the query string.
+    Returns None when no seed is provided.
+    """
+    if "seed" not in request.query:
+        return None
+    return int(request.query["seed"])
+
+
 def get_lan_ip():
     """
     get_lan_ip()
