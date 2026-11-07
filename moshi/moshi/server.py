@@ -158,7 +158,25 @@ class ServerState:
             voice_prompt_filename = request.query["voice_prompt"]
             requested_voice_prompt_path = None
             if voice_prompt_filename is not None:
-                requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
+                # Reject path traversal / absolute paths: restrict to a bare basename
+                # within voice_prompt_dir. Without this, an attacker could supply
+                # values like "../../etc/passwd" or "/abs/path/malicious.pt" and
+                # have the server torch.load() an arbitrary file (RCE via pickle).
+                safe_name = os.path.basename(voice_prompt_filename)
+                if (
+                    not safe_name
+                    or safe_name != voice_prompt_filename
+                    or safe_name in (".", "..")
+                    or os.path.isabs(voice_prompt_filename)
+                    or os.sep in voice_prompt_filename
+                    or (os.altsep and os.altsep in voice_prompt_filename)
+                ):
+                    raise web.HTTPBadRequest(reason="Invalid voice_prompt name")
+                voice_prompt_dir_real = os.path.realpath(self.voice_prompt_dir)
+                candidate = os.path.realpath(os.path.join(voice_prompt_dir_real, safe_name))
+                if os.path.commonpath([voice_prompt_dir_real, candidate]) != voice_prompt_dir_real:
+                    raise web.HTTPBadRequest(reason="Invalid voice_prompt path")
+                requested_voice_prompt_path = candidate
             # If the voice prompt file does not exist, find a valid (s0) voiceprompt file in the directory
             if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
                 raise FileNotFoundError(
