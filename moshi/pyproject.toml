@@ -12,6 +12,7 @@ dependencies = [
     "sphn >= 0.1.4, < 0.2",
     "torch >= 2.2.0, < 2.5",
     "aiohttp>=3.10.5, <3.11",
+    "accelerate==0.30.1", 
 ]
 authors = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
 maintainers = [{name="Rajarshi Roy", email="rajarshir@nvidia.com"}]
