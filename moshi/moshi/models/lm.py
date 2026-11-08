@@ -179,6 +179,8 @@ def encode_from_sphn(mimi, samples, max_batch=sys.maxsize):
             break
 
         batch = torch.cat(current_batch, dim=0)  # shape: (B, C, T)
+        model_dtype = next(mimi.parameters()).dtype
+        batch = batch.to(dtype=model_dtype)
         encoded = mimi.encode(batch)  # shape: (B, K, F)
         separated = torch.unbind(encoded, dim=0)  # shape: (K, F)
         reshaped = [x.unsqueeze(0) for x in separated]  # shape: (1, K, F)

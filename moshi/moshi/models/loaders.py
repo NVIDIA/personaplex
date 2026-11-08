@@ -252,6 +252,19 @@ def get_moshi_lm(
 
     # Assign weights to target device
     dev = torch.device(device) if isinstance(device, str) else device
+
+    # Patch 3: materialize any model parameters still absent from the
+    # checkpoint. The model is initialized on the meta device, so a key that
+    # is neither in the checkpoint nor covered by the patches above would
+    # survive load_state_dict(strict=False, assign=True) as a meta tensor and
+    # crash the final .to() with "Cannot copy out of meta tensor". This
+    # happens e.g. for depformer_emb.7 when expanding a base Moshi dep_q=8
+    # checkpoint to dep_q=16 (indices 8..15 are backfilled from 0..7, but
+    # index 7 itself does not exist in the checkpoint). Zero-init and warn.
+    for name, tensor in model_sd.items():
+        if name not in state_dict:
+            print(f"Zero-initializing key missing from checkpoint: {name}")
+            state_dict[name] = torch.zeros(tensor.shape, dtype=dtype, device=dev)
     for key in state_dict:
         state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
     
