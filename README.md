@@ -26,6 +26,9 @@ sudo apt install libopus-dev
 
 # Fedora/RHEL
 sudo dnf install opus-devel
+
+# macOS (Homebrew)
+brew install opus
 ```
 
 ### Installation
@@ -47,6 +50,26 @@ Then set up your Huggingface authentication:
 ```bash
 export HF_TOKEN=<YOUR_HUGGINGFACE_TOKEN>
 ```
+
+### Device Selection
+
+`moshi.server` now auto-selects `cuda`, then `mps`, then `cpu`.
+
+On Apple Silicon, you can also force Metal explicitly:
+```bash
+SSL_DIR=$(mktemp -d); python -m moshi.server --ssl "$SSL_DIR" --device mps
+```
+
+`moshi.offline` accepts the same `--device` flag, for example:
+```bash
+python -m moshi.offline --device mps \
+  --voice-prompt "NATF2.pt" \
+  --input-wav "assets/test/input_assistant.wav" \
+  --output-wav "output.wav" \
+  --output-text "output.json"
+```
+
+Note: MPS support depends on the local PyTorch build and Apple Metal support available on the host machine.
 
 ### Launch Server
 

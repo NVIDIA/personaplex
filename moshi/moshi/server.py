@@ -52,7 +52,7 @@ from .utils.logging import setup_logger, ColorizedLog
 
 
 logger = setup_logger(__name__)
-DeviceString = Literal["cuda"] | Literal["cpu"] #| Literal["mps"]
+DeviceString = Literal["cuda"] | Literal["cpu"] | Literal["mps"]
 
 def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
     """Return a torch.device based on the requested string or availability."""
@@ -60,8 +60,8 @@ def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
         return torch.device(requested)
     if torch.cuda.is_available():
         return torch.device("cuda")
-    #elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    #    return torch.device("mps")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
