@@ -215,6 +215,10 @@ class ServerState:
                     return
                 await asyncio.sleep(0.001)
                 pcm = opus_reader.read_pcm()
+                if pcm is None:
+                    # client opus stream ended (disconnect mid-stream);
+                    # exit cleanly so the session lock is released.
+                    return
                 if pcm.shape[-1] == 0:
                     continue
                 if all_pcm_data is None:
