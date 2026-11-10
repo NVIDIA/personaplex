@@ -22,6 +22,7 @@ readme = "README.md"
 [project.scripts]
 moshi-server = "moshi.server:main"
 moshi-offline = "moshi.offline:main"
+moshi-stdio = "moshi.stdio:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "moshi.__version__"}
