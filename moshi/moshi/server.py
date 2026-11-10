@@ -28,13 +28,13 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 import json
-import random
 import os
 from pathlib import Path
-import tarfile
-import time
+import random
 import secrets
 import sys
+import tarfile
+import time
 from typing import Literal, Optional
 
 import aiohttp
@@ -44,7 +44,6 @@ import numpy as np
 import sentencepiece
 import sphn
 import torch
-import random
 
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
@@ -195,21 +194,21 @@ class ServerState:
         # self.lm_gen.top_k_text = max(1, int(request.query["text_topk"]))
         # self.lm_gen.top_k = max(1, int(request.query["audio_topk"]))
         
-        # Construct full voice prompt path
+        # Construct full voice prompt path with path-traversal protection
         requested_voice_prompt_path = None
         voice_prompt_path = None
         if self.voice_prompt_dir is not None:
-            voice_prompt_filename = request.query["voice_prompt"]
-            requested_voice_prompt_path = None
-            if voice_prompt_filename is not None:
-                requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
-            # If the voice prompt file does not exist, find a valid (s0) voiceprompt file in the directory
-            if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
-                raise FileNotFoundError(
-                    f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
+            voice_prompt_filename = request.query.get("voice_prompt", "")
+            base_dir = os.path.realpath(self.voice_prompt_dir)
+            if voice_prompt_filename:
+                candidate = os.path.realpath(os.path.join(base_dir, os.path.basename(voice_prompt_filename)))
+                if candidate.startswith(base_dir + os.sep):
+                    requested_voice_prompt_path = candidate
+            if requested_voice_prompt_path is None or not os.path.isfile(requested_voice_prompt_path):
+                raise web.HTTPBadRequest(
+                    text=f"Requested voice prompt '{voice_prompt_filename}' not found."
                 )
-            else:
-                voice_prompt_path = requested_voice_prompt_path
+            voice_prompt_path = requested_voice_prompt_path
                 
         if self.lm_gen.voice_prompt != voice_prompt_path:
             if voice_prompt_path.endswith('.pt'):

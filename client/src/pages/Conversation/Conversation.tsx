@@ -82,7 +82,6 @@ const buildURL = ({
     url.searchParams.append("api_key", apiKey);
   }
 
-  console.log(url.toString());
   return url.toString();
 };
 

@@ -122,12 +122,23 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
+client/.env.*
+!client/.env.example
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# OS / Bundled runtime artifacts
+.DS_Store
+**/.DS_Store
+node-v*-linux-*/
+node-v*.tar.xz
+node-v*.tar.gz
 
 # Spyder project settings
 .spyderproject
