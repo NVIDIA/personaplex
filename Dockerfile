@@ -1,3 +1,13 @@
+# ── Stage 1: Build the React/Vite frontend ──────────────────────────
+FROM node:20-slim AS frontend
+
+WORKDIR /app/client
+COPY client/package.json client/package-lock.json ./
+RUN npm ci
+COPY client/ ./
+RUN npm run build
+
+# ── Stage 2: Python backend with CUDA runtime ───────────────────────
 ARG BASE_IMAGE="nvcr.io/nvidia/cuda"
 ARG BASE_IMAGE_TAG="12.4.1-runtime-ubuntu22.04"
 
@@ -9,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
     libopus-dev \
- && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/moshi/
 
@@ -17,9 +27,12 @@ COPY moshi/ /app/moshi/
 RUN uv venv /app/moshi/.venv --python 3.12
 RUN uv sync
 
+# Copy the pre-built frontend
+COPY --from=frontend /app/client/dist /app/client-dist
+
 RUN mkdir -p /app/ssl
 
 EXPOSE 8998
 
 ENTRYPOINT []
-CMD ["/app/moshi/.venv/bin/python", "-m", "moshi.server", "--ssl", "/app/ssl"]
+CMD ["/app/moshi/.venv/bin/python", "-m", "moshi.server", "--ssl", "/app/ssl", "--static", "/app/client-dist"]

@@ -23,8 +23,8 @@ type useUserAudioArgs = {
 export const useUserAudio = ({
   constraints,
   onDataChunk,
-  onRecordingStart = () => {},
-  onRecordingStop = () => {},
+  onRecordingStart = () => { },
+  onRecordingStop = () => { },
 }: useUserAudioArgs) => {
   const { stereoMerger, audioContext, micDuration } = useMediaContext();
   const [error, setError] = useState<string | null>(null);
@@ -70,11 +70,14 @@ export const useUserAudio = ({
         bufferLength: Math.round(960 * audioContext.current.sampleRate / 24000),
         encoderFrameSize: 20,
         encoderSampleRate: 24000,
-        maxFramesPerPage: 2,
+        // Send each frame immediately instead of batching 2 — reduces latency by ~20ms
+        maxFramesPerPage: 1,
         numberOfChannels: 1,
         recordingGain: 1,
-        resampleQuality: 3,
-        encoderComplexity: 0,
+        // Increased from 3 to 7 for higher quality resampling (clearer voice)
+        resampleQuality: 7,
+        // Increased from 0 (fastest/lowest quality) to 5 for much clearer voice encoding
+        encoderComplexity: 5,
         encoderApplication: 2049,
         streamPages: true,
       };
