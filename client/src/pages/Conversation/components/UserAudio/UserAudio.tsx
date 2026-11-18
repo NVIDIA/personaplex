@@ -1,4 +1,4 @@
-import { FC, useCallback, useEffect, useRef, useState } from "react";
+import { FC, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSocketContext } from "../../SocketContext";
 import { useUserAudio } from "../../hooks/useUserAudio";
 import { ClientVisualizer } from "../AudioVisualizer/ClientVisualizer";
@@ -11,6 +11,15 @@ export const UserAudio: FC<UserAudioProps> = ({theme}) => {
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
   const { sendMessage, socketStatus } = useSocketContext();
   const containerRef = useRef<HTMLDivElement>(null);
+  const constraints = useMemo<MediaStreamConstraints>(() => ({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    },
+    video: false,
+  }), []);
   const onRecordingStart = useCallback(() => {
     console.log("Recording started");
   }, []);
@@ -33,15 +42,7 @@ export const UserAudio: FC<UserAudioProps> = ({theme}) => {
   );
 
   const { startRecordingUser, stopRecording } = useUserAudio({
-    constraints: {
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        channelCount: 1,
-      },
-      video: false,
-    },
+    constraints,
     onDataChunk: onRecordingChunk,
     onRecordingStart,
     onRecordingStop,

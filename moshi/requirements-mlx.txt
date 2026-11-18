@@ -1,0 +1,4 @@
+-r requirements.txt
+mlx>=0.26,<0.27; platform_system == "Darwin" and platform_machine == "arm64"
+moshi_mlx==0.3.0; platform_system == "Darwin" and platform_machine == "arm64"
+rustymimi==0.4.1; platform_system == "Darwin" and platform_machine == "arm64"
