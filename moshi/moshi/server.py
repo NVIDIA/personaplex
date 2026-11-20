@@ -52,7 +52,7 @@ from .utils.logging import setup_logger, ColorizedLog
 
 
 logger = setup_logger(__name__)
-DeviceString = Literal["cuda"] | Literal["cpu"] #| Literal["mps"]
+DeviceString = Literal["cuda"] | Literal["cpu"] | Literal["mps"]
 
 def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
     """Return a torch.device based on the requested string or availability."""
@@ -60,8 +60,8 @@ def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
         return torch.device(requested)
     if torch.cuda.is_available():
         return torch.device("cuda")
-    #elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    #    return torch.device("mps")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -375,7 +375,7 @@ def main():
     parser.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO,
                         help="HF repo to look into, defaults PersonaPlex. "
                              "Use this to select a different pre-trained model.")
-    parser.add_argument("--device", type=str, default="cuda", help="Device on which to run, defaults to 'cuda'.")
+    parser.add_argument("--device", type=str, default=None, help="Device on which to run, auto-detected if not set.")
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
