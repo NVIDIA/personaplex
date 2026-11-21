@@ -49,6 +49,7 @@ from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
+from .utils.runtime_compat import apply_runtime_compatibility_guard
 
 
 logger = setup_logger(__name__)
@@ -425,6 +426,7 @@ def main():
         f"Static path does not exist: {static_path}."
     logger.info(f"static_path = {static_path}")
     args.device = torch_auto_device(args.device)
+    apply_runtime_compatibility_guard(args.device, warn=logger.warning)
 
     seed_all(42424242)
 

@@ -55,6 +55,12 @@ def no_compile():
         _compile_disabled = prev_disabled
 
 
+def set_compile_disabled(disabled: bool = True) -> None:
+    """Globally disable torch.compile-backed wrappers at runtime."""
+    global _compile_disabled
+    _compile_disabled = disabled
+
+
 def torch_compile_lazy(fun):
     """torch.compile creates a huge pool of processes, even when not using the function at all,
     e.g. with Dora. This can polute stderr when doing CTRL+C. So we do it in a lazy way.
@@ -205,6 +211,12 @@ def no_cuda_graph():
         yield
     finally:
         _disable_cuda_graph = old_value
+
+
+def set_cuda_graph_disabled(disabled: bool = True) -> None:
+    """Globally disable CUDA graph replay at runtime."""
+    global _disable_cuda_graph
+    _disable_cuda_graph = disabled
 
 
 class CUDAGraphed:

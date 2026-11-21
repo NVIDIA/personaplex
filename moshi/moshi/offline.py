@@ -57,6 +57,7 @@ from .models import loaders, LMGen, MimiModel
 from .models.lm import load_audio as lm_load_audio
 from .models.lm import _iterate_audio as lm_iterate_audio
 from .models.lm import encode_from_sphn as lm_encode_from_sphn
+from .utils.runtime_compat import apply_runtime_compatibility_guard
 
 
 def log(level: str, msg: str):
@@ -184,6 +185,8 @@ def run_inference(
     """
     if seed is not None and seed != -1:
         seed_all(seed)
+
+    apply_runtime_compatibility_guard(device, warn=lambda msg: log("warning", msg))
 
     # Download config.json to increment download counter
     # No worries about double-counting since config.json will be cached the second time
