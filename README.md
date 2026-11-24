@@ -1,5 +1,7 @@
 # PersonaPlex: Voice and Role Control for Full Duplex Conversational Speech Models
 
+Kind of MM second me 
+
 [![Weights](https://img.shields.io/badge/🤗-Weights-yellow)](https://huggingface.co/nvidia/personaplex-7b-v1)
 [![Paper](https://img.shields.io/badge/📄-Paper-blue)](https://arxiv.org/abs/2602.06053)
 [![Demo](https://img.shields.io/badge/🎮-Demo-green)](https://research.nvidia.com/labs/adlr/personaplex/)
