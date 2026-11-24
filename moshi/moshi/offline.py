@@ -122,6 +122,18 @@ def decode_tokens_to_pcm(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, 
     return pcm
 
 
+def _safe_tar_extract(tar: tarfile.TarFile, path: str | Path) -> None:
+    """Extract tar contents with path traversal protection."""
+    dest = os.path.realpath(str(path))
+    for member in tar.getmembers():
+        member_path = os.path.realpath(os.path.join(dest, member.name))
+        if not member_path.startswith(dest + os.sep) and member_path != dest:
+            raise RuntimeError(
+                f"Refusing to extract {member.name!r}: would write outside {dest}"
+            )
+    tar.extractall(path=path)
+
+
 def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
     """
     If voice_prompt_dir is None:
@@ -142,7 +154,7 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
     if not voices_dir.exists():
         log("info", f"extracting {voices_tgz} to {voices_dir}")
         with tarfile.open(voices_tgz, "r:gz") as tar:
-            tar.extractall(path=voices_tgz.parent)
+            _safe_tar_extract(tar, voices_tgz.parent)
 
     if not voices_dir.exists():
         raise RuntimeError("voices.tgz did not contain a 'voices/' directory")
