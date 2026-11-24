@@ -44,14 +44,11 @@ const buildURL = ({
   textSeed: number;
   audioSeed: number;
 }) => {
-  const newWorkerAddr = useMemo(() => {
-    if (workerAddr == "same" || workerAddr == "") {
-      const newWorkerAddr = window.location.hostname + ":" + window.location.port;
-      console.log("Overriding workerAddr to", newWorkerAddr);
-      return newWorkerAddr;
-    }
-    return workerAddr;
-  }, [workerAddr]);
+  let newWorkerAddr = workerAddr;
+  if (workerAddr === "same" || workerAddr === "") {
+    newWorkerAddr = window.location.hostname + ":" + window.location.port;
+    console.log("Overriding workerAddr to", newWorkerAddr);
+  }
   const wsProtocol = (window.location.protocol === 'https:') ? 'wss' : 'ws';
   const url = new URL(`${wsProtocol}://${newWorkerAddr}/api/chat`);
   if(workerAuthId) {

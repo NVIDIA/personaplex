@@ -220,7 +220,7 @@ def get_moshi_lm(
     for name, tensor in list(state_dict.items()):
         if "depformer" in name and "self_attn" in name and name in model_sd:
             if tensor.shape != model_sd[name].shape:
-                print("Expanding %s", name)
+                print(f"Expanding {name}")
                 missing = (
                     tensor
                     if copy_missing_weights
@@ -241,14 +241,14 @@ def get_moshi_lm(
                     if needle in name:
                         src = name.replace(needle, f"{rep}.{old}.")
                         if src in state_dict:
-                            print("Replacing %s <- %s", name, src)
+                            print(f"Replacing {name} <- {src}")
                             state_dict[name] = state_dict[src]
                             replaced = True
                         break
                 if replaced:
                     break
             if not replaced:
-                print("Missing %s", name)
+                print(f"Missing {name}")
 
     # Assign weights to target device
     dev = torch.device(device) if isinstance(device, str) else device

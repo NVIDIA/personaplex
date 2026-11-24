@@ -141,7 +141,7 @@ export const Queue:FC = () => {
     if(env.VITE_ENV === "development") {
       eruda.init();
     }
-    () => {
+    return () => {
       if(env.VITE_ENV === "development") {
         eruda.destroy();
       }

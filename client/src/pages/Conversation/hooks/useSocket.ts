@@ -33,12 +33,7 @@ export const useSocket = ({
 
   const onDisconnect = useCallback((event: CloseEvent) => {
     const closedSocket = event.target as WebSocket;
-    console.log("disconnected");
-    setSocketStatus("disconnected");
-    if (onDisconnectProp) {
-      onDisconnectProp();
-    }
-    // ONLY clear socketRef.current if it's the one that closed
+    // Only act on the current socket; ignore stale connections
     if (socketRef.current === closedSocket) {
       console.log("disconnected (current socket)");
       socketRef.current = null;
