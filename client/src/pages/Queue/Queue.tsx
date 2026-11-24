@@ -138,11 +138,12 @@ export const Queue:FC = () => {
   
   // enable eruda in development
   useEffect(() => {
-    if(env.VITE_ENV === "development") {
+    if (env.VITE_ENV === "development") {
       eruda.init();
     }
-    () => {
-      if(env.VITE_ENV === "development") {
+
+    return () => {
+      if (env.VITE_ENV === "development") {
         eruda.destroy();
       }
     };
