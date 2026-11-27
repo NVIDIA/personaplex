@@ -1,0 +1,13 @@
+FROM vllm/vllm:v0.33.0
+
+COPY resources/ /opt/resources/
+
+RUN apt-get update && apt-get install -y git
+
+WORKDIR /opt/resources
+RUN chmod +x install_patched_vllm_omni.sh
+RUN ./install_patched_vllm_omni.sh
+
+# Replace the inherited API-server entrypoint with a benchmark-friendly shell.
+ENTRYPOINT []
+CMD ["/bin/bash"]

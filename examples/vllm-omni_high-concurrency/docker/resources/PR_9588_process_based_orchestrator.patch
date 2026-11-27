@@ -1,0 +1,1972 @@
+diff --git a/docs/design/fullduplex.md b/docs/design/fullduplex.md
+index cacf36806..5890837e1 100644
+--- a/docs/design/fullduplex.md
++++ b/docs/design/fullduplex.md
+@@ -33,6 +33,11 @@ turn-based stack free of duplex code, and exposes the same session to three
+ consumers: the OpenAI Realtime WebSocket route, the in-process Python API and
+ the model plugins.
+ 
++## Runtime process placement
++
++The optional process runtime isolates the orchestrator from the frontend GIL
++and serves sessions only. See [process runtime usage, ownership, and limits](../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
++
+ ## Playback completion ownership
+ 
+ `DuplexEngineSession` owns response snapshots and playback cursors. Output
+diff --git a/docs/design/module/entrypoints.md b/docs/design/module/entrypoints.md
+index db8203fab..003e0a9e1 100644
+--- a/docs/design/module/entrypoints.md
++++ b/docs/design/module/entrypoints.md
+@@ -108,6 +108,9 @@ stage-client channel configuration and does not launch or retire backend
+ processes. CLI validation rejects unsupported distributed, diffusion,
+ fault-tolerant, elastic-EP, Ray, and runtime-LoRA combinations before startup.
+ 
++`DuplexOmni` supports an optional session-only process runtime. See
++[process runtime usage, ownership, and limits](../../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
++
+ It does not own configuration precedence, cross-stage routing, stage
+ placement, payload implementation, or semantic error classification.
+ `entrypoints/openai/errors.py` is an explicit primary-path exception owned by
+diff --git a/docs/serving/full_duplex_api.md b/docs/serving/full_duplex_api.md
+index 1028929a8..0d40cc411 100644
+--- a/docs/serving/full_duplex_api.md
++++ b/docs/serving/full_duplex_api.md
+@@ -11,13 +11,94 @@ This page is the endpoint overview. For the complete wire contract, the
+ `vllm_omni.clients.duplex.DuplexClient` Python library, and the per-model
+ capability gates, see the [Realtime Duplex API guide](realtime_duplex_api.md).
+ 
++## Run the duplex runtime in a separate process
++
++The default `DuplexOmni` backend runs the orchestrator on a background thread
++in the frontend process. Use `--duplex-engine-backend-as-process` to give the
++native runtime its own Python process and GIL:
++
++```bash
++vllm serve "$MODEL" --omni \
++  --deploy-config "$DEPLOY_CONFIG" \
++  --duplex-engine-backend-as-process
++```
++
++Set `MODEL` to the checkpoint and `DEPLOY_CONFIG` to its deployment YAML.
++The deployment must resolve to `session_mode: duplex`. The option is independent
++of the model plugin, stage count, and stage worker backend.
++
++Enabling this option makes the deployment **session-only**, including when the
++model also supports chat. It serves the duplex WebSocket routes, `/v1/models`,
++`/health`, and metrics. Chat and other generation routes are unavailable.
++The model's reported `DuplexCapabilities` remain unchanged. Keep the default
++`duplex_engine_backend_as_process=False` to serve chat alongside sessions.
++
++For embedded Python use, pass `duplex_engine_backend_as_process=True` to
++`DuplexOmni`. Protect the program entrypoint for Python's `spawn` start method:
++
++```python
++import asyncio
++import os
++
++from vllm_omni.entrypoints.duplex_omni import DuplexOmni
++
++
++async def main():
++    omni = DuplexOmni(
++        model=os.environ["MODEL"],
++        deploy_config=os.environ["DEPLOY_CONFIG"],
++        duplex_engine_backend_as_process=True,
++    )
++    try:
++        async with await omni.open_session() as session:
++            # Use the same session.submit(), session.events(), and resume APIs.
++            await session.heartbeat()
++    finally:
++        await omni.aclose()
++
++
++if __name__ == "__main__":
++    asyncio.run(main())
++```
++
++Process mode currently requires a POSIX host and an importable program
++entrypoint. Model registrations must be available in the child through the
++normal `vllm.general_plugins` mechanism; parent-only registry mutations are
++not inherited. Startup options must be compatible with `spawn`, and session
++commands/configuration must contain MessagePack-compatible data. The frontend
++receives stage IDs, types, and effective context limits, not full stage
++configurations or processors. Generation, tokenization, profiling, sleep/wake,
++and weight-transfer administration are outside this session-only interface.
++
++`DuplexOmni` retains session handles and lifecycle behavior;
++`ProcessDuplexEngineClient` owns spawning, IPC, and child teardown. The child
++owns the native orchestrator thread and stage clients. The processes exchange
++MessagePack data over a private socketpair using asyncio, without reader or
++writer threads. Both backends share the frontend output pump and engine-death
++handling.
++
++Each process keeps bounded per-session output buffers. Each IPC direction
++admits at most 2048 queued messages and 16 MiB of encoded queued data; larger
++individual messages are rejected. The active write and socket buffers are
++additional to this budget. Frontend output overflow closes the affected session;
++worker or transport failure fails pending controls and closes local buffers.
++`await omni.aclose()` requests graceful worker cleanup; synchronous `shutdown()`
++provides bounded process-group termination. Serialization and buffering add
++costs, so benchmark the target workload.
++
++Invalidations share the event stream: the frontend removes matching queued
++audio and rejects stale epochs, but cannot revoke audio committed while the
++notification was in transit. Resume leases and replay control IDs remain owned
++by the native engine; process mode adds no cross-frontend session ownership or
++resume support.
++
+ ## Choose an Endpoint
+ 
+ | Endpoint | Protocol | Recommended use |
+ | --- | --- | --- |
+ | `WS /v1/realtime?duplex=1` | OpenAI Realtime-style events (the normative contract) | Applications and browser clients |
+ | `WS /v1/duplex` | Alias of `/v1/realtime?duplex=1` (same protocol, same handler) | Clients that prefer a dedicated path |
+-| Python: `DuplexOmni` / `InlineDuplexClient` | Typed commands and events in-process | Embedding the model without a server |
++| Python: `DuplexOmni` / `InlineDuplexClient` | Typed commands and events through local session handles | Embedding the model without a server |
+ 
+ ## Enable Full Duplex
+ 
+diff --git a/tests/engine/duplex/test_process_engine.py b/tests/engine/duplex/test_process_engine.py
+new file mode 100644
+index 000000000..3b450da05
+--- /dev/null
++++ b/tests/engine/duplex/test_process_engine.py
+@@ -0,0 +1,453 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
++
++"""Real spawn and IPC coverage without model weights or GPU execution."""
++
++from __future__ import annotations
++
++import asyncio
++import os
++import socket
++from dataclasses import dataclass
++from unittest.mock import AsyncMock, Mock
++
++import msgspec
++import pytest
++from vllm.v1.engine.exceptions import EngineDeadError
++
++from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
++from vllm_omni.engine.duplex.commands import AppendAudio, AppendText, ClearOutputAudio
++from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
++from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
++from vllm_omni.engine.duplex.events import AudioDelta, OutputAudioCleared, SessionClosed, SessionCreated
++from vllm_omni.engine.duplex.messages import DuplexControlResultMessage, DuplexSessionError, DuplexSessionEventMessage
++from vllm_omni.engine.duplex.process_engine import (
++    _QUEUE_BYTES,
++    ProcessDuplexEngineClient,
++    ProcessDuplexStageMetadata,
++    _DuplexProcessWorker,
++    _MessageSocket,
++)
++
++pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
++
++
++class FakeEngine:
++    def __init__(self, small_buffers=False):
++        self.duplex_session_config = DuplexSessionRuntimeConfig(
++            max_pending_output_events_per_session=2 if small_buffers else 512,
++        )
++        self.duplex_capabilities = DuplexCapabilities(supports_chat_completions=True, supports_session_resume=True)
++        self.stage_configs = [ProcessDuplexStageMetadata(i, "llm", {"max_model_len": 2048}) for i in range(4)]
++        self.stage_vllm_configs = [None] * 4
++        self.num_stages = 4  # Not restricted to Moshi's two/three-stage deployments.
++        self.config_path = None
++        self.endpoint_restrictions = ()
++        self.duplex_frontend_group_count = 2
++        self.duplex_frontend_max_sessions = 8
++        self.buffers = {}
++        self.output: asyncio.Queue[DuplexSessionEventMessage] = asyncio.Queue()
++        self.lease = {}
++
++    def result(self, session_id, operation):
++        return DuplexControlResultMessage(
++            control_id="test",
++            operation=operation,
++            session_id=session_id,
++            ok=True,
++            capabilities=self.duplex_capabilities,
++            public_session={"worker_pid": os.getpid(), "worker_loop": type(asyncio.get_running_loop()).__module__},
++            lease_generation=self.lease.get(session_id, 0),
++        )
++
++    async def open_session_async(self, session_id, config, *, output_buffer, **kwargs):
++        if config.extra_body.get("reject"):
++            raise DuplexSessionError("admission rejected", code="capacity", retryable=True, session_id=session_id)
++        if config.extra_body.get("slow_open"):
++            await asyncio.sleep(0.1)
++        self.buffers[session_id] = output_buffer
++        output_buffer.put(SessionCreated(session_id=session_id, session={"id": session_id}))
++        return self.result(session_id, "open")
++
++    async def submit_command_async(self, session_id, command):
++        import pybase64 as base64
++
++        buffer = self.buffers[session_id]
++        if isinstance(command, AppendAudio):
++            buffer.put(
++                AudioDelta(
++                    session_id=session_id, response_id="r", epoch=0, delta=base64.b64encode(command.audio).decode()
++                )
++            )
++        elif isinstance(command, ClearOutputAudio):
++            buffer.invalidate("r", 0)
++            buffer.put(OutputAudioCleared(session_id=session_id, response_id="r", epoch=1))
++            buffer.put(AudioDelta(session_id=session_id, response_id="r", epoch=0, delta="c3RhbGU="))
++            buffer.put(AudioDelta(session_id=session_id, response_id="r", epoch=1, delta="ZnJlc2g="))
++        elif isinstance(command, AppendText) and command.text == "crash":
++            os._exit(17)
++        elif isinstance(command, AppendText) and command.text == "bad_output":
++            self.output.put_nowait("unexpected engine output")
++        elif isinstance(command, AppendText) and command.text == "reject":
++            raise DuplexSessionError("queue full", code="engine_backpressure", retryable=True)
++
++    async def close_session_async(self, session_id, *, reason, **kwargs):
++        await self.output.put(
++            DuplexSessionEventMessage(session_id=session_id, event=SessionClosed(session_id=session_id, reason=reason))
++        )
++        return self.result(session_id, "close")
++
++    async def resume_session_async(self, session_id, *, expected_lease_generation, control_id=None, **kwargs):
++        key = (session_id, control_id)
++        if key not in self.lease:
++            self.lease[session_id] = expected_lease_generation + 1
++            self.lease[key] = True
++        return self.result(session_id, "resume")
++
++    async def touch_session_async(self, session_id, **kwargs):
++        if kwargs.get("activity") == "hang":
++            await asyncio.Future()
++        return self.result(session_id, "touch")
++
++    async def get_outputs_async(self):
++        return [await self.output.get()]
++
++
++@dataclass
++class FakeRuntime:
++    model: str
++    engine: FakeEngine
++    process_warmup_audio: dict[str, object]
++    health_error: bool = False
++    shutdown_path: str | None = None
++
++    async def check_health(self):
++        if self.health_error:
++            raise EngineDeadError("Stage-2 has no live replica")
++
++    def shutdown(self):
++        if self.shutdown_path is not None:
++            with open(self.shutdown_path, "w") as marker:
++                marker.write("closed")
++
++
++def fake_factory(model, options):
++    return FakeRuntime(
++        model,
++        FakeEngine(options.get("small_buffers", False)),
++        {"audio": "AAAAAA==", "format": "pcm_f32le", "sample_rate_hz": 24000},
++        health_error=options.get("health_error", False),
++        shutdown_path=options.get("shutdown_path"),
++    )
++
++
++def failing_factory(model, options):
++    raise RuntimeError("test startup failure")
++
++
++def make_client(**options):
++    return ProcessDuplexEngineClient("fake", {"init_timeout": 30, **options}, factory=fake_factory)
++
++
++def test_transport_streams_both_directions():
++    async def run():
++        a, b = socket.socketpair()
++        a.setblocking(False)
++        b.setblocking(False)
++        ar, aw = await asyncio.open_connection(sock=a)
++        br, bw = await asyncio.open_connection(sock=b)
++        left, right = _MessageSocket(ar, aw), _MessageSocket(br, bw)
++        for i in range(64):
++            await left.send(("command", i, b"pcm"))
++            await right.send(("event", i, b"audio"))
++        tasks = [asyncio.create_task(left.write()), asyncio.create_task(right.write())]
++        try:
++            assert [await right.receive() for _ in range(64)] == [["command", i, b"pcm"] for i in range(64)]
++            assert [await left.receive() for _ in range(64)] == [["event", i, b"audio"] for i in range(64)]
++            assert left.pending_bytes == right.pending_bytes == 0
++        finally:
++            for task in tasks:
++                task.cancel()
++            await asyncio.gather(*tasks, return_exceptions=True)
++            aw.close()
++            bw.close()
++            await asyncio.gather(aw.wait_closed(), bw.wait_closed())
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("partial_eof", [False, True])
++def test_transport_handles_partial_and_consecutive_messages(partial_eof):
++    async def run():
++        a, b = socket.socketpair()
++        a.setblocking(False)
++        b.setblocking(False)
++        ar, aw = await asyncio.open_connection(sock=a)
++        br, bw = await asyncio.open_connection(sock=b)
++        receiver = _MessageSocket(br, bw)
++        # A value larger than the read chunk must survive multiple feed() calls.
++        first = ("event", b"audio" * 20000)
++        payload = msgspec.msgpack.encode(first)
++        receive = asyncio.create_task(receiver.receive())
++        try:
++            aw.write(payload[:-1])
++            await aw.drain()
++            await asyncio.sleep(0)
++            assert not receive.done()
++            if partial_eof:
++                aw.close()
++                with pytest.raises(EOFError):
++                    await asyncio.wait_for(receive, 5)
++            else:
++                # Finish the partial value and append another in the same write.
++                aw.write(payload[-1:] + msgspec.msgpack.encode(("result", 1, True, None)))
++                await aw.drain()
++                assert await asyncio.wait_for(receive, 5) == list(first)
++                assert await asyncio.wait_for(receiver.receive(), 5) == ["result", 1, True, None]
++                aw.close()
++                with pytest.raises(EOFError):
++                    await asyncio.wait_for(receiver.receive(), 5)
++        finally:
++            receive.cancel()
++            await asyncio.gather(receive, return_exceptions=True)
++            aw.close()
++            bw.close()
++            await asyncio.gather(aw.wait_closed(), bw.wait_closed())
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("limit", ["messages", "bytes"])
++def test_transport_close_wakes_blocked_senders(monkeypatch, limit):
++    async def run():
++        import vllm_omni.engine.duplex.process_engine as transport
++
++        message = ("command", b"pcm")
++        monkeypatch.setattr(transport, "_QUEUE_SIZE", 1 if limit == "messages" else 1024)
++        if limit == "bytes":
++            monkeypatch.setattr(transport, "_QUEUE_BYTES", len(msgspec.msgpack.encode(message)))
++        channel = _MessageSocket(asyncio.StreamReader(), Mock())
++        await channel.send(message)
++        blocked = [asyncio.create_task(channel.send(message)) for _ in range(2)]
++        await asyncio.sleep(0)
++        assert all(not task.done() for task in blocked)
++        channel.close("worker exited")
++        for task in blocked:
++            with pytest.raises(DuplexSessionError, match="worker exited") as failed:
++                await asyncio.wait_for(task, 1)
++            assert failed.value.code == "engine_dead"
++        with pytest.raises(DuplexSessionError):
++            await channel.send(message)
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancellation"])
++def test_transport_abandoned_send_is_not_delivered(monkeypatch, cancel):
++    async def run():
++        monkeypatch.setattr("vllm_omni.engine.duplex.process_engine._QUEUE_SIZE", 1)
++        writer = Mock(drain=AsyncMock())
++        channel = _MessageSocket(asyncio.StreamReader(), writer)
++        await channel.send(("first",))
++        blocked = asyncio.create_task(channel.send(("abandoned",), timeout=1 if cancel else 0.01))
++        if cancel:
++            await asyncio.sleep(0)
++            blocked.cancel()
++            with pytest.raises(asyncio.CancelledError):
++                await blocked
++        else:
++            with pytest.raises(DuplexSessionError) as failed:
++                await blocked
++            assert failed.value.code == "engine_backpressure"
++            assert failed.value.retryable
++        pump = asyncio.create_task(channel.write())
++        try:
++            await asyncio.sleep(0)
++            await channel.send(("last",))
++            await asyncio.sleep(0)
++            assert [msgspec.msgpack.decode(call.args[0]) for call in writer.write.call_args_list] == [
++                ["first"],
++                ["last"],
++            ]
++        finally:
++            pump.cancel()
++            await asyncio.gather(pump, return_exceptions=True)
++            channel.close()
++
++    asyncio.run(run())
++
++
++def test_transport_rejects_oversized_message():
++    with pytest.raises(ValueError, match="queue budget"):
++        _MessageSocket.entry(("command", b"x" * _QUEUE_BYTES))
++
++
++def test_native_values_survive_msgpack():
++    command = AppendAudio(audio=b"pcm", video_frames=("frame",), hints={"model_hint": [1, True]})
++    assert msgspec.msgpack.decode(msgspec.msgpack.encode(command), type=AppendAudio) == command
++    config = DuplexSessionConfig(model="fake", extra_body={"custom": {"value": [1, 2]}}).normalized()
++    assert msgspec.msgpack.decode(msgspec.msgpack.encode(config), type=DuplexSessionConfig) == config
++    for capabilities in (None, DuplexCapabilities(supports_session_resume=True)):
++        result = DuplexControlResultMessage(
++            control_id="test", operation="open", session_id="s", ok=True, capabilities=capabilities
++        )
++        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(result))
++        assert msgspec.convert(decoded, type=DuplexControlResultMessage) == result
++
++
++@pytest.mark.parametrize("operation", ["check_health_async", "get_outputs_async"])
++def test_cancelled_startup_waiter_does_not_cancel_shared_connection(monkeypatch, operation):
++    """An abandoned IPC caller must leave startup usable by later callers."""
++
++    async def run():
++        client = make_client()
++        started, release = asyncio.Event(), asyncio.Event()
++        connect = client._connect
++
++        async def paused_connect():
++            started.set()
++            await release.wait()
++            await connect()
++
++        monkeypatch.setattr(client, "_connect", paused_connect)
++        first = asyncio.create_task(getattr(client, operation)())
++        try:
++            await asyncio.wait_for(started.wait(), 5)
++            first.cancel()
++            with pytest.raises(asyncio.CancelledError):
++                await first
++            assert client._start_task is not None and not client._start_task.cancelled()
++            release.set()
++            await asyncio.wait_for(client.check_health_async(), 5)
++            buffer = DuplexOutputBuffer(max_bytes=1024, max_events=8)
++            result = await asyncio.wait_for(
++                client.open_session_async("s", DuplexSessionConfig(), output_buffer=buffer), 5
++            )
++            assert result.ok
++            assert isinstance(await asyncio.wait_for(buffer.get(), 5), SessionCreated)
++            await client.close_session_async("s", reason="done")
++            outputs = await client.get_outputs_async(timeout=5)
++            assert outputs[0].event.reason == "done"
++        finally:
++            release.set()
++            first.cancel()
++            await asyncio.gather(first, return_exceptions=True)
++            client.shutdown()
++
++    asyncio.run(run())
++
++
++def test_spawned_client_streams_audio_controls_and_invalidations():
++    async def run():
++        client = make_client()
++        try:
++            assert client.num_stages == 4
++            assert client.metadata.warmup_audio["sample_rate_hz"] == 24000
++            assert client.duplex_capabilities.supports_chat_completions  # Model facts are unchanged.
++            await client.check_health_async()
++            rejected = DuplexOutputBuffer(max_bytes=1024, max_events=8)
++            with pytest.raises(DuplexSessionError) as failed:
++                await client.open_session_async(
++                    "rejected", DuplexSessionConfig(extra_body={"reject": True}), output_buffer=rejected
++                )
++            assert failed.value.code == "capacity"
++            assert "rejected" not in client._buffers
++            buffer = DuplexOutputBuffer(max_bytes=1024 * 1024, max_events=512)
++            result = await client.open_session_async("s", DuplexSessionConfig(), output_buffer=buffer)
++            assert result.public_session["worker_pid"] != os.getpid()
++            assert result.public_session["worker_loop"] == "uvloop"
++            assert isinstance(await buffer.get(), SessionCreated)
++            for i in range(40):
++                await client.submit_command_async("s", AppendAudio(audio=bytes([i]) * 1920))
++            for i in range(40):
++                event = await asyncio.wait_for(buffer.get(), 5)
++                assert event.audio == bytes([i]) * 1920
++            held = event
++            await client.submit_command_async("s", ClearOutputAudio(response_id="r"))
++            for _ in range(100):
++                if not buffer.is_valid(held):
++                    break
++                await asyncio.sleep(0.01)
++            with buffer.guard(held) as valid:
++                assert not valid
++            assert isinstance(await buffer.get(), OutputAudioCleared)
++            assert (await buffer.get()).audio == b"fresh"
++            await client.touch_session_async("s", activity="heartbeat")
++            result = await client.resume_session_async("s", expected_lease_generation=0, control_id="resume")
++            assert result.lease_generation == 1
++            result = await client.resume_session_async("s", expected_lease_generation=0, control_id="resume")
++            assert result.lease_generation == 1
++            await client.close_session_async("s", reason="done")
++            outputs = await client.get_outputs_async(timeout=5)
++            assert outputs[0].event.reason == "done"
++        finally:
++            await client.aclose()
++        assert not client._process.is_alive()
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("failure", ["crash", "bad_output"])
++def test_child_death_wakes_pending_controls_and_buffers(tmp_path, failure):
++    async def run():
++        marker = tmp_path / "shutdown"
++        client = make_client(shutdown_path=str(marker))
++        try:
++            buffer = DuplexOutputBuffer(max_bytes=1024, max_events=8)
++            await client.open_session_async("s", DuplexSessionConfig(), output_buffer=buffer)
++            await buffer.get()
++            pending = asyncio.create_task(client.touch_session_async("s", activity="hang"))
++            await asyncio.sleep(0.05)
++            await client.submit_command_async("s", AppendText(text=failure))
++            assert await asyncio.wait_for(buffer.get(), 5) is None
++            with pytest.raises(DuplexSessionError) as failed:
++                await asyncio.wait_for(pending, 5)
++            assert failed.value.code == "engine_dead"
++        finally:
++            client.shutdown()
++        if failure == "bad_output":
++            assert marker.read_text() == "closed"
++            assert client._process.exitcode == 0
++
++    asyncio.run(run())
++
++
++@pytest.mark.parametrize("failure", ["eof", "writer", "invalidation"])
++def test_worker_stops_all_tasks_on_disconnect_or_overflow(monkeypatch, failure):
++    async def run():
++        monkeypatch.setattr("vllm_omni.engine.duplex.process_engine._QUEUE_SIZE", 1)
++        reader = asyncio.StreamReader()
++        writer = Mock(drain=AsyncMock(), close=Mock(side_effect=reader.feed_eof))
++        channel = _MessageSocket(reader, writer)
++        worker = _DuplexProcessWorker(fake_factory("fake", {}), channel)
++        log = Mock()
++        monkeypatch.setattr("vllm_omni.engine.duplex.process_engine.logger.error", log)
++        if failure == "eof":
++            reader.feed_eof()
++        elif failure == "writer":
++            monkeypatch.setattr(channel, "write", AsyncMock(side_effect=BrokenPipeError))
++        else:
++            # Hold the writer stalled so the queue stays full while the event
++            # loop delivers an orchestrator-thread invalidation.
++            monkeypatch.setattr(channel, "write", asyncio.Event().wait)
++            await channel.send(("queued",))
++            worker.notify_invalidation("s", "r", 0)
++        tasks_before = asyncio.all_tasks()
++        try:
++            await asyncio.wait_for(worker.run(), 1)
++            assert asyncio.all_tasks() == tasks_before
++            assert not worker.buffers
++            if failure == "invalidation":
++                log.assert_called_once_with("Duplex IPC invalidation queue overflow")
++                writer.close.assert_called()
++            else:
++                log.assert_not_called()
++        finally:
++            channel.close()
++
++    asyncio.run(run())
++
++
++def test_startup_failure_propagates():
++    with pytest.raises(RuntimeError, match="test startup failure"):
++        ProcessDuplexEngineClient("fake", {"init_timeout": 30}, factory=failing_factory)
+diff --git a/tests/entrypoints/test_process_duplex_omni.py b/tests/entrypoints/test_process_duplex_omni.py
+new file mode 100644
+index 000000000..066bc0c52
+--- /dev/null
++++ b/tests/entrypoints/test_process_duplex_omni.py
+@@ -0,0 +1,207 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
++
++"""Session-only backend through public handles and the standard HTTP server."""
++
++from __future__ import annotations
++
++import asyncio
++
++import httpx
++import pytest
++from fastapi import FastAPI
++from vllm.v1.engine.exceptions import EngineDeadError
++
++from tests.engine.duplex.test_process_engine import fake_factory
++from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
++from vllm_omni.engine.duplex.events import AudioDelta, SessionClosed, SessionCreated
++from vllm_omni.entrypoints.duplex.warmup import lookup_duplex_plugin, warmup_silence_unit
++from vllm_omni.entrypoints.duplex_omni import DuplexOmni
++from vllm_omni.entrypoints.openai import api_server
++
++pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
++
++
++@pytest.fixture
++def process_omni(monkeypatch):
++    monkeypatch.setattr("vllm_omni.entrypoints.duplex_omni._ProcessWorkerRuntime", fake_factory)
++    omni = DuplexOmni("fake", duplex_engine_backend_as_process=True, init_timeout=30)
++    yield omni
++    omni.shutdown()
++
++
++@pytest.mark.asyncio
++async def test_public_handles_and_session_only_guard(process_omni):
++    omni = process_omni
++    assert omni.session_only
++    assert omni.duplex_capabilities.supports_chat_completions
++    assert await omni.get_supported_tasks() == ()
++    assert await omni.get_vllm_config() is None
++    assert omni.vllm_config is None
++    assert omni.model_config is None
++    assert omni.get_diffusion_od_config() is None
++    with pytest.raises(NotImplementedError, match="sessions only"):
++        await anext(omni.generate("hello"))
++    handles = await asyncio.gather(*(omni.open_session() for _ in range(4)))
++
++    async def exercise(handle):
++        stream = handle.events()
++        assert isinstance(await anext(stream), SessionCreated)
++        for i in range(20):
++            await handle.append_audio(bytes([i]) * 1920)
++        for i in range(20):
++            event = await asyncio.wait_for(anext(stream), 5)
++            assert isinstance(event, AudioDelta)
++            assert event.audio == bytes([i]) * 1920
++        await omni.resume_session(handle.session_id, expected_lease_generation=0)
++        assert handle.lease_generation == 1
++        await omni.detach_session(handle.session_id, expected_lease_generation=1)
++        await handle.close()
++        assert isinstance(await anext(stream), SessionClosed)
++        await stream.aclose()
++
++    await asyncio.gather(*(exercise(handle) for handle in handles))
++    assert not omni.sessions
++    await omni.aclose()
++    assert not omni.engine.is_alive()
++
++
++@pytest.mark.asyncio
++async def test_server_models_health_and_chat_restriction(process_omni):
++    from tests.entrypoints.openai_api.test_duplex_api_server import _minimal_args
++
++    app = FastAPI()
++    app.include_router(api_server.router)
++    await api_server.omni_init_app_state(process_omni, app.state, _minimal_args(model="fake"))
++    shutdown_unsupported_routes(app, process_omni.endpoint_restrictions)
++    assert app.state.openai_serving_chat is None
++    assert app.state.openai_serving_duplex is not None
++    assert app.state.online_renderer is None
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
++        assert (await client.get("/health")).status_code == 200
++        models = await client.get("/v1/models")
++        assert models.status_code == 200
++        assert models.json()["data"][0]["id"] == "fake"
++        chat = await client.post("/v1/chat/completions", json={"model": "fake", "messages": []})
++        assert chat.status_code == 400
++        assert "sessions only" in chat.text
++    plugin = lookup_duplex_plugin(process_omni)
++    assert warmup_silence_unit(plugin)["sample_rate_hz"] == 24000
++    assert plugin.capabilities(max_sessions=1).supports_chat_completions
++    await process_omni.aclose()
++
++
++@pytest.mark.asyncio
++async def test_slow_frontend_session_does_not_kill_healthy_session(monkeypatch):
++    monkeypatch.setattr("vllm_omni.entrypoints.duplex_omni._ProcessWorkerRuntime", fake_factory)
++    omni = DuplexOmni("fake", duplex_engine_backend_as_process=True, init_timeout=30, small_buffers=True)
++    try:
++        slow = await omni.open_session()
++        for _ in range(10):
++            if slow.closed:
++                break
++            await slow.append_audio(b"audio")
++            await asyncio.sleep(0.05)
++        assert await asyncio.wait_for(slow.wait_closed(), 5) == "frontend_output_overflow"
++        assert omni.engine.is_alive()
++        healthy = await omni.open_session()
++        await healthy.close()
++    finally:
++        await omni.aclose()
++
++
++@pytest.mark.asyncio
++async def test_worker_death_closes_handles(process_omni):
++    handle = await process_omni.open_session()
++    stream = handle.events()
++    await anext(stream)
++    await handle.append_text("crash")
++    assert "engine_dead" in await asyncio.wait_for(handle.wait_closed(), 5)
++    assert not process_omni.sessions
++    await stream.aclose()
++
++
++@pytest.mark.asyncio
++async def test_cli_backend_selection_and_turn_rejection(monkeypatch):
++    from argparse import Namespace
++
++    from tests.entrypoints.test_serve import _parse_serve_args
++    from vllm_omni.utils.tracking_parser import TrackingNamespace
++
++    default_args = _parse_serve_args(["serve", "fake", "--omni"])
++    assert default_args.duplex_engine_backend_as_process is False
++    assert "duplex_engine_backend_as_process" not in default_args.get_explicit_kwargs_dict()
++    args = _parse_serve_args(["serve", "fake", "--omni", "--duplex-engine-backend-as-process"])
++    assert args.get_explicit_kwargs_dict()["duplex_engine_backend_as_process"] is True
++    monkeypatch.setattr(api_server, "_should_serve_duplex", lambda *_: False)
++    args = TrackingNamespace(
++        Namespace(model="fake", disable_log_stats=True, duplex_engine_backend_as_process=True),
++        frozenset({"model", "duplex_engine_backend_as_process"}),
++    )
++    with pytest.raises(ValueError, match="session_mode: duplex"):
++        async with api_server.build_async_omni_from_stage_config(args):
++            pytest.fail("A turn-based deployment must not create a process duplex client")
++
++
++@pytest.mark.asyncio
++async def test_serving_context_selects_process_and_closes_it(monkeypatch):
++    from argparse import Namespace
++
++    from vllm_omni.utils.tracking_parser import TrackingNamespace
++
++    monkeypatch.setattr("vllm_omni.entrypoints.duplex_omni._ProcessWorkerRuntime", fake_factory)
++    monkeypatch.setattr(api_server, "_should_serve_duplex", lambda *_: True)
++    args = TrackingNamespace(
++        Namespace(model="fake", disable_log_stats=True, duplex_engine_backend_as_process=True),
++        frozenset({"model", "duplex_engine_backend_as_process"}),
++    )
++    async with api_server.build_async_omni_from_stage_config(args) as omni:
++        assert omni.session_only
++        assert omni.engine.is_alive()
++        assert len(omni.stage_configs) == omni.num_stages == 4
++        assert omni.stage_configs[1].engine_args["max_model_len"] == 2048
++        await omni.open_session()
++    assert not omni.engine.is_alive()
++    assert not omni.sessions
++
++
++def test_websocket_audio_uses_spawned_runtime(monkeypatch):
++    from contextlib import asynccontextmanager
++
++    from fastapi.testclient import TestClient
++
++    from tests.entrypoints.openai_api.test_duplex_api_server import _minimal_args
++
++    monkeypatch.setattr("vllm_omni.entrypoints.duplex_omni._ProcessWorkerRuntime", fake_factory)
++
++    @asynccontextmanager
++    async def lifespan(app):
++        omni = DuplexOmni("fake", duplex_engine_backend_as_process=True, init_timeout=30)
++        try:
++            await api_server.omni_init_app_state(omni, app.state, _minimal_args(model="fake"))
++            app.state.api_server_count = 1
++            yield
++        finally:
++            await omni.aclose()
++
++    app = FastAPI(lifespan=lifespan)
++    app.include_router(api_server.router)
++    with TestClient(app) as client, client.websocket_connect("/v1/realtime?duplex=1&model=fake") as websocket:
++        assert websocket.receive_json()["type"] == "session.created"
++        websocket.send_json({"type": "input_audio_buffer.append", "audio": "AAAA"})
++        event = websocket.receive_json()
++        assert event["type"] == "response.output_audio.delta"
++        assert event["delta"] == "AAAA"
++
++
++@pytest.mark.asyncio
++async def test_shared_frontend_checks_worker_health_not_just_process_liveness(monkeypatch):
++    monkeypatch.setattr("vllm_omni.entrypoints.duplex_omni._ProcessWorkerRuntime", fake_factory)
++    omni = DuplexOmni("fake", duplex_engine_backend_as_process=True, init_timeout=30, health_error=True)
++    try:
++        assert omni.engine.is_alive()
++        with pytest.raises(EngineDeadError, match="Stage-2"):
++            await omni.check_health()
++        assert omni.engine.is_alive()
++    finally:
++        await omni.aclose()
+diff --git a/vllm_omni/engine/duplex/messages.py b/vllm_omni/engine/duplex/messages.py
+index ed10db109..c711ceee4 100644
+--- a/vllm_omni/engine/duplex/messages.py
++++ b/vllm_omni/engine/duplex/messages.py
+@@ -14,11 +14,12 @@ from __future__ import annotations
+ 
+ from typing import TYPE_CHECKING, Literal
+ 
++from vllm_omni.engine.duplex.config import DuplexCapabilities
+ from vllm_omni.engine.messages import EngineQueueMessage
+ 
+ if TYPE_CHECKING:
+     from vllm_omni.engine.duplex.commands import DuplexCommand
+-    from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
++    from vllm_omni.engine.duplex.config import DuplexSessionConfig
+     from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
+     from vllm_omni.engine.duplex.events import DuplexEvent
+ 
+diff --git a/vllm_omni/engine/duplex/process_engine.py b/vllm_omni/engine/duplex/process_engine.py
+new file mode 100644
+index 000000000..bb022566a
+--- /dev/null
++++ b/vllm_omni/engine/duplex/process_engine.py
+@@ -0,0 +1,734 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
++
++"""Process-owned native duplex runtime and its session-only engine client.
++
++Only a privately inherited socketpair connects the frontend and worker. Typed
++commands/events are encoded as MessagePack data, never executable objects.
++The native engine retains its orchestrator thread and owns all stage clients.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import itertools
++import multiprocessing
++import os
++import signal
++import socket
++import traceback
++from collections.abc import Callable
++from contextlib import suppress
++from dataclasses import dataclass
++from functools import partial
++from typing import Any, Protocol
++
++import anyio
++import msgpack
++import msgspec
++import uvloop
++from anyio.abc import TaskGroup
++from vllm.logger import init_logger
++from vllm.v1.engine.exceptions import EngineDeadError
++
++from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
++from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
++from vllm_omni.engine.duplex import commands, events
++from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
++from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer, DuplexOutputOverflowError
++from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone, SessionClosed, error_event
++from vllm_omni.engine.duplex.messages import DuplexControlResultMessage, DuplexSessionError, DuplexSessionEventMessage
++
++logger = init_logger(__name__)
++_QUEUE_SIZE = 2048
++_QUEUE_BYTES = 16 * 1024 * 1024
++_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
++_READ_BYTES = 64 * 1024
++_COMMAND_TYPES = {
++    value.__name__: value
++    for value in vars(commands).values()
++    if isinstance(value, type) and issubclass(value, commands.DuplexCommand)
++}
++_EVENT_TYPES = {
++    value.__name__: value
++    for value in vars(events).values()
++    if isinstance(value, type) and issubclass(value, events.DuplexEvent)
++}
++_CONTROLS = frozenset({"open_session_async", "close_session_async", "resume_session_async", "touch_session_async"})
++
++
++class WorkerRuntime(Protocol):
++    """Factory result; the process module has no entrypoint/model imports."""
++
++    model: str
++    engine: Any  # Native engine or the lightweight engine used by spawn tests.
++    process_warmup_audio: dict[str, object]
++
++    async def check_health(self) -> None: ...
++
++    def shutdown(self) -> None: ...
++
++
++EngineFactory = Callable[[str, dict[str, Any]], WorkerRuntime]
++
++
++@dataclass(frozen=True)
++class ProcessDuplexStageMetadata:
++    """Small deployment snapshot; stage clients and processors stay in the worker."""
++
++    stage_id: int
++    stage_type: str
++    engine_args: dict[str, int | None]
++
++
++@dataclass(frozen=True)
++class ProcessDuplexMetadata:
++    """Serializable startup facts needed by the frontend without stage clients."""
++
++    model: str
++    num_stages: int
++    stage_configs: list[ProcessDuplexStageMetadata]
++    config_path: str | None
++    duplex_session_config: DuplexSessionRuntimeConfig
++    duplex_capabilities: DuplexCapabilities
++    frontend_group_count: int
++    frontend_max_sessions: int
++    warmup_audio: dict[str, object]
++    endpoint_restrictions: list[tuple[str, str]]
++
++    @classmethod
++    def from_runtime(cls, runtime: WorkerRuntime) -> ProcessDuplexMetadata:
++        """Snapshot deployment facts after the native runtime has initialized."""
++        engine = runtime.engine
++        stages = []
++        for stage, vllm_config in zip(engine.stage_configs, engine.stage_vllm_configs):
++            model_config = getattr(vllm_config, "model_config", None)
++            max_model_len = getattr(model_config, "max_model_len", None)
++            stages.append(
++                ProcessDuplexStageMetadata(
++                    stage_id=stage.stage_id,
++                    stage_type=getattr(stage.stage_type, "value", stage.stage_type),
++                    engine_args={
++                        "max_model_len": max_model_len
++                        if max_model_len is not None
++                        else stage.engine_args.get("max_model_len")
++                    },
++                )
++            )
++        return cls(
++            model=runtime.model,
++            num_stages=engine.num_stages,
++            stage_configs=stages,
++            config_path=engine.config_path,
++            duplex_session_config=engine.duplex_session_config,
++            duplex_capabilities=engine.duplex_capabilities,
++            frontend_group_count=engine.duplex_frontend_group_count,
++            frontend_max_sessions=engine.duplex_frontend_max_sessions,
++            warmup_audio=runtime.process_warmup_audio,
++            endpoint_restrictions=[(r.capability.name, r.reason) for r in engine.endpoint_restrictions],
++        )
++
++
++class _MessageSocket:
++    """Bounded FIFO with one async writer and a streaming MessagePack reader."""
++
++    def __init__(
++        self,
++        reader: asyncio.StreamReader,
++        writer: asyncio.StreamWriter,
++        unpacker: msgpack.Unpacker | None = None,
++    ) -> None:
++        self.reader, self.writer = reader, writer
++        self.unpacker = unpacker if unpacker is not None else _new_unpacker()
++        self.queue: asyncio.Queue[bytes] = asyncio.Queue(_QUEUE_SIZE)
++        self.pending_bytes = 0
++        self._space = asyncio.Event()
++        self._failure: str | None = None
++
++    @staticmethod
++    def entry(message: tuple[Any, ...]) -> bytes:
++        """Encode one message and reject payloads exceeding the queue byte budget."""
++        payload = msgspec.msgpack.encode(message)
++        if len(payload) > _QUEUE_BYTES:
++            raise ValueError("Duplex IPC message exceeds the 16 MiB queue budget")
++        return payload
++
++    def put_nowait(self, entry: bytes) -> None:
++        """Admit encoded data without waiting; raise QueueFull or engine_dead."""
++        if self._failure is not None:
++            raise DuplexSessionError(self._failure, code="engine_dead")
++        if self.pending_bytes + len(entry) > _QUEUE_BYTES:
++            raise asyncio.QueueFull
++        self.queue.put_nowait(entry)
++        self.pending_bytes += len(entry)
++
++    async def send(self, message: tuple[Any, ...], *, timeout: float | None = None) -> None:
++        """Wait for queue admission, not peer delivery.
++
++        The optional timeout bounds capacity waits and reports retryable
++        backpressure. Cancellation before admission leaves no queued message.
++        """
++        entry = self.entry(message)
++        try:
++            self.put_nowait(entry)
++        except asyncio.QueueFull:
++            try:
++                await asyncio.wait_for(self.send_entry(entry), timeout)
++            except (TimeoutError, asyncio.TimeoutError) as exc:
++                raise DuplexSessionError(
++                    "Duplex IPC queue is full", code="engine_backpressure", retryable=True
++                ) from exc
++
++    async def send_entry(self, entry: bytes) -> None:
++        """Wait for queue capacity or fail when the channel closes."""
++        while True:
++            try:
++                self.put_nowait(entry)
++                return
++            except asyncio.QueueFull:
++                self._space.clear()
++                await self._space.wait()
++
++    async def write(self) -> None:
++        """Drain admitted messages in FIFO order; run as the sole writer task.
++
++        Capacity is released before socket drain, so the active payload and
++        transport buffers are additional to the queue byte budget.
++        """
++        while True:
++            payload = await self.queue.get()
++            self.pending_bytes -= len(payload)
++            self._space.set()
++            self.writer.write(payload)
++            await self.writer.drain()
++
++    async def receive(self) -> Any:
++        """Decode the next value, retaining partial and trailing data across reads."""
++        while True:
++            for message in self.unpacker:
++                return message
++            chunk = await self.reader.read(_READ_BYTES)
++            if not chunk:
++                raise EOFError("Duplex IPC connection closed")
++            self.unpacker.feed(chunk)
++
++    def close(self, detail: str = "Duplex IPC connection closed") -> None:
++        """Reject new sends, wake capacity waiters, and close the socket transport."""
++        self._failure = self._failure or detail
++        self._space.set()
++        self.writer.close()
++
++
++def _new_unpacker() -> msgpack.Unpacker:
++    return msgpack.Unpacker(raw=False, strict_map_key=False, timestamp=3, max_buffer_size=_MAX_MESSAGE_BYTES)
++
++
++def _error(exc: Exception) -> dict[str, Any]:
++    return {
++        "message": str(exc),
++        "code": getattr(exc, "code", "engine_error"),
++        "retryable": getattr(exc, "retryable", False),
++        "session_id": getattr(exc, "session_id", None),
++    }
++
++
++def _worker(sock: socket.socket, model: str, options: dict[str, Any], factory: EngineFactory) -> None:
++    """Create a process group for the runtime and its children, then start its loop."""
++    os.setsid()
++    uvloop.run(_serve_worker(sock, model, options, factory))
++
++
++async def _serve_worker(sock: socket.socket, model: str, options: dict[str, Any], factory: EngineFactory) -> None:
++    """Initialize the runtime, send its startup result, and serve until shutdown.
++
++    Startup uses the blocking socket before handing it to asyncio. This scope
++    owns native runtime cleanup after the worker tasks have stopped.
++    """
++    runtime = None
++    channel = None
++    ready = False
++    try:
++        runtime = factory(model, options)
++        payload = msgspec.msgpack.encode((True, ProcessDuplexMetadata.from_runtime(runtime)))
++        if len(payload) > _MAX_MESSAGE_BYTES:
++            raise ValueError("Oversized duplex startup metadata")
++        sock.sendall(payload)
++        ready = True
++        sock.setblocking(False)
++        reader, writer = await asyncio.open_connection(sock=sock)
++        channel = _MessageSocket(reader, writer)
++        await _DuplexProcessWorker(runtime, channel).run()
++    except Exception:
++        logger.exception("Duplex engine process failed")
++        if not ready:
++            with suppress(OSError):
++                sock.sendall(msgspec.msgpack.encode((False, traceback.format_exc())))
++    finally:
++        if runtime is not None:
++            runtime.shutdown()
++        if channel is not None:
++            channel.close()
++            with suppress(ConnectionError):
++                await channel.writer.wait_closed()
++        sock.close()
++
++
++class _ProcessOutputBuffer(DuplexOutputBuffer):
++    """Native session buffer that forwards invalidations over the process boundary."""
++
++    def __init__(self, limits: DuplexSessionRuntimeConfig, notify: Callable[[str, int], None]) -> None:
++        super().__init__(
++            max_bytes=limits.max_pending_output_bytes_per_session,
++            max_events=limits.max_pending_output_events_per_session,
++        )
++        self._notify_invalidation = notify
++
++    def invalidate(self, response_id: str, through_epoch: int) -> None:
++        super().invalidate(response_id, through_epoch)
++        self._notify_invalidation(response_id, through_epoch)
++
++
++class _DuplexProcessWorker:
++    """Child-side session forwarding; owns buffers and supervised runtime tasks."""
++
++    def __init__(self, runtime: WorkerRuntime, channel: _MessageSocket) -> None:
++        self.runtime, self.engine, self.channel = runtime, runtime.engine, channel
++        self.loop = asyncio.get_running_loop()
++        self.buffers: dict[str, DuplexOutputBuffer] = {}
++        self.tasks: TaskGroup
++
++    async def run(self) -> None:
++        """Supervise worker tasks, cancelling siblings on failure or disconnect."""
++        async with anyio.create_task_group() as self.tasks:
++            self.tasks.start_soon(self.read_requests)
++            self.tasks.start_soon(self.pump_engine)
++            with suppress(ConnectionError):
++                await self.channel.write()
++            self.tasks.cancel_scope.cancel()
++
++    def notify_invalidation(self, session_id: str, response_id: str, through_epoch: int) -> None:
++        """Schedule an invalidation from the orchestrator thread onto the IPC loop.
++
++        Overflow closes the channel: losing an invalidation could let stale
++        audio reach the frontend.
++        """
++        entry = self.channel.entry(("invalidate", session_id, response_id, through_epoch))
++
++        def enqueue() -> None:
++            try:
++                self.channel.put_nowait(entry)
++            except DuplexSessionError:
++                return  # The channel closed before this callback ran.
++            except asyncio.QueueFull:
++                logger.error("Duplex IPC invalidation queue overflow")
++                self.channel.close("Duplex IPC invalidation queue overflow")
++
++        self.loop.call_soon_threadsafe(enqueue)
++
++    async def send_event(self, session_id: str, event: events.DuplexEvent) -> None:
++        await self.channel.send(("event", session_id, type(event).__name__, event))
++
++    async def pump_session(self, session_id: str, buffer: DuplexOutputBuffer) -> None:
++        """Forward valid buffered events until closure, then retire the buffer."""
++        try:
++            while (event := await buffer.get()) is not None:
++                if buffer.is_valid(event):
++                    await self.send_event(session_id, event)
++        finally:
++            self.buffers.pop(session_id, None)
++
++    async def pump_engine(self) -> None:
++        """Forward engine events, routing session closure through its output buffer."""
++        while True:
++            for message in await self.engine.get_outputs_async():
++                if not isinstance(message, DuplexSessionEventMessage):
++                    raise RuntimeError(f"Unexpected session-only engine output: {message!r}")
++                buffer = self.buffers.get(message.session_id)
++                if isinstance(message.event, SessionClosed) and buffer is not None:
++                    buffer.close(message.event)
++                else:
++                    await self.send_event(message.session_id, message.event)
++
++    async def control(self, request_id: int, operation: str, args: list[Any], kwargs: dict[str, Any]) -> None:
++        """Execute a control RPC and return its result or a structured error."""
++        try:
++            if operation == "open_session_async":
++                session_id = args[0]
++                args[1] = msgspec.convert(args[1], type=DuplexSessionConfig)
++                buffer = _ProcessOutputBuffer(
++                    self.engine.duplex_session_config, partial(self.notify_invalidation, session_id)
++                )
++                self.buffers[session_id] = buffer
++                self.tasks.start_soon(self.pump_session, session_id, buffer)
++                try:
++                    result = await self.engine.open_session_async(*args, output_buffer=buffer, **kwargs)
++                except BaseException:
++                    buffer.close()
++                    raise
++            elif operation == "check_health":
++                await self.runtime.check_health()
++                result = None
++            else:
++                result = await getattr(self.engine, operation)(*args, **kwargs)
++            await self.channel.send(("result", request_id, True, result))
++        except Exception as exc:
++            await self.channel.send(("result", request_id, False, _error(exc)))
++
++    async def read_requests(self) -> None:
++        """Dispatch commands in receive order and run control RPCs concurrently."""
++        with suppress(EOFError, ConnectionError):
++            while True:
++                request_id, operation, args, kwargs = await self.channel.receive()
++                if operation == "shutdown":
++                    break
++                if operation == "submit_command_async":
++                    session_id, name, data = args
++                    command: commands.DuplexCommand = msgspec.convert(data, type=_COMMAND_TYPES[name])
++                    try:
++                        await self.engine.submit_command_async(session_id, command)
++                    except Exception as exc:
++                        await self.send_event(session_id, error_event(getattr(exc, "code", "engine_error"), str(exc)))
++                elif operation in _CONTROLS or operation == "check_health":
++                    self.tasks.start_soon(self.control, request_id, operation, args, kwargs)
++                else:
++                    raise ValueError(f"Unsupported duplex IPC operation: {operation}")
++        self.tasks.cancel_scope.cancel()
++
++
++class ProcessDuplexEngineClient:
++    """Session engine client; owns IPC and local delivery buffers, never handles.
++
++    Invalidation is applied before later events on the IPC stream. It cannot
++    revoke a frontend send already committed before the notification arrives.
++    """
++
++    supported_tasks: tuple[str, ...] = ()
++    input_processor = None
++
++    def __init__(self, model: str, options: dict[str, Any], *, factory: EngineFactory) -> None:
++        """Spawn the runtime and synchronously wait for startup metadata or failure."""
++        from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
++
++        if os.name != "posix":
++            raise ValueError("The process duplex backend requires a POSIX host")
++        if "PROMETHEUS_MULTIPROC_DIR" not in os.environ:
++            setup_multiprocess_prometheus()
++        self._pending: dict[int, asyncio.Future[Any]] = {}
++        self._ids = itertools.count()
++        self._buffers: dict[str, DuplexOutputBuffer] = {}
++        self._invalidated: dict[str, dict[str, int]] = {}
++        self._outputs: asyncio.Queue[DuplexSessionEventMessage] = asyncio.Queue(_QUEUE_SIZE)
++        self._failure: str | None = None
++        self._channel: _MessageSocket | None = None
++        self._start_task: asyncio.Task[None] | None = None
++        self._tasks: list[asyncio.Task[None]] = []
++        self._cleanup_tasks: set[asyncio.Task[Any]] = set()
++        self._closed = False
++        self._unpacker = _new_unpacker()
++        self._socket, child = socket.socketpair()
++        self._socket.settimeout(float(options.get("init_timeout", 600)) + 30)
++        self._process = multiprocessing.get_context("spawn").Process(
++            target=_worker, args=(child, model, options, factory), name="duplex-engine"
++        )
++        try:
++            self._process.start()
++            child.close()
++            ok, facts = self._read_startup()
++            if not ok:
++                raise RuntimeError(f"Duplex engine process startup failed:\n{facts}")
++            self.metadata = msgspec.convert(facts, type=ProcessDuplexMetadata)
++            self.config_path = self.metadata.config_path
++            self.stage_configs = self.metadata.stage_configs
++            self.endpoint_restrictions = tuple(
++                EndpointRestriction(OmniServingCapability[name], reason)
++                for name, reason in self.metadata.endpoint_restrictions
++            )
++            self.duplex_session_config = self.metadata.duplex_session_config
++            self.duplex_capabilities = self.metadata.duplex_capabilities
++            self.num_stages = self.metadata.num_stages
++            self.duplex_frontend_group_count = self.metadata.frontend_group_count
++            self.duplex_frontend_max_sessions = self.metadata.frontend_max_sessions
++            self._socket.setblocking(False)
++            logger.info("Duplex process ready: frontend PID=%d engine PID=%d", os.getpid(), self._process.pid)
++        except BaseException:
++            child.close()
++            self.shutdown()
++            raise
++
++    def get_frontend_vllm_config(self) -> None:
++        """The worker owns stage configurations and generation processors."""
++        return None
++
++    def get_frontend_diffusion_od_config(self) -> None:
++        return None
++
++    def _read_startup(self) -> Any:
++        """Read the blocking startup reply, preserving trailing data for async reads."""
++        while True:
++            for message in self._unpacker:
++                return message
++            chunk = self._socket.recv(_READ_BYTES)
++            if not chunk:
++                raise RuntimeError("Duplex engine process exited during startup")
++            self._unpacker.feed(chunk)
++
++    def start(self) -> None:
++        """Lazily attach IPC tasks to the caller's running event loop."""
++        if self._start_task is None:
++            self._start_task = asyncio.create_task(self._connect())
++
++    async def _connect(self) -> None:
++        reader, writer = await asyncio.open_connection(sock=self._socket)
++        self._channel = _MessageSocket(reader, writer, self._unpacker)
++        self._tasks = [asyncio.create_task(self._channel.write()), asyncio.create_task(self._read())]
++        for task in self._tasks:
++            task.add_done_callback(self._transport_done)
++
++    def _transport_done(self, task: asyncio.Task[None]) -> None:
++        """Fan out transport failure and cancel the other IPC task."""
++        exc = None if task.cancelled() else task.exception()
++        if self._closed:
++            return
++        self._fail(str(exc or "IPC connection closed"))
++        for other in self._tasks:
++            if other is not task:
++                other.cancel()
++
++    def _fail(self, detail: str) -> None:
++        """Fail pending controls and close local buffers, waking their consumers."""
++        self._failure = detail
++        if self._channel is not None:
++            with suppress(RuntimeError):
++                self._channel.close(detail)
++        for future in self._pending.values():
++            if not future.done():
++                future.set_exception(DuplexSessionError(detail, code="engine_dead"))
++        for buffer in self._buffers.values():
++            buffer.close()
++        self._buffers.clear()
++        self._invalidated.clear()
++
++    async def _send(self, message: tuple[Any, ...]) -> None:
++        if self._closed or self._failure:
++            raise DuplexSessionError(self._failure or "engine closed", code="engine_dead")
++        self.start()
++        assert self._start_task is not None
++        await asyncio.shield(self._start_task)
++        assert self._channel is not None
++        await self._channel.send(message, timeout=30)
++
++    async def _rpc(self, operation: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
++        """Correlate a control reply with a bounded wait and retire its future.
++
++        A timeout or caller cancellation does not cancel work in the child;
++        late replies are ignored after the pending entry is removed.
++        """
++        request_id = next(self._ids)
++        future = asyncio.get_running_loop().create_future()
++        self._pending[request_id] = future
++        try:
++            await self._send((request_id, operation, args, kwargs))
++            try:
++                return await asyncio.wait_for(future, kwargs.get("timeout", 10))
++            except (TimeoutError, asyncio.TimeoutError) as exc:
++                raise DuplexSessionError(f"{operation} IPC timeout", code="timeout", retryable=True) from exc
++        finally:
++            self._pending.pop(request_id, None)
++            if not future.done():
++                future.cancel()
++            elif not future.cancelled():
++                future.exception()
++
++    async def open_session_async(
++        self,
++        session_id: str,
++        config: DuplexSessionConfig,
++        *,
++        output_buffer: DuplexOutputBuffer,
++        timeout: float | None = 60,
++    ) -> DuplexControlResultMessage:
++        """Register local output delivery before asking the worker to open a session."""
++        self._buffers[session_id] = output_buffer
++        try:
++            return await self._rpc("open_session_async", (session_id, config), {"timeout": timeout})
++        except BaseException:
++            self._buffers.pop(session_id, None)
++            self._invalidated.pop(session_id, None)
++            raise
++
++    async def close_session_async(
++        self, session_id: str, *, reason: str = "client_close", timeout: float | None = 10
++    ) -> DuplexControlResultMessage:
++        return await self._rpc("close_session_async", (session_id,), {"reason": reason, "timeout": timeout})
++
++    async def resume_session_async(
++        self,
++        session_id: str,
++        *,
++        expected_lease_generation: int,
++        control_id: str | None = None,
++        timeout: float | None = 10,
++    ) -> DuplexControlResultMessage:
++        return await self._rpc(
++            "resume_session_async",
++            (session_id,),
++            {"expected_lease_generation": expected_lease_generation, "control_id": control_id, "timeout": timeout},
++        )
++
++    async def touch_session_async(
++        self,
++        session_id: str,
++        *,
++        activity: str,
++        expected_lease_generation: int | None = None,
++        timeout: float | None = 10,
++    ) -> DuplexControlResultMessage:
++        return await self._rpc(
++            "touch_session_async",
++            (session_id,),
++            {"activity": activity, "expected_lease_generation": expected_lease_generation, "timeout": timeout},
++        )
++
++    async def submit_command_async(self, session_id: str, command: commands.DuplexCommand) -> None:
++        """Queue a command; worker-side rejection arrives as a session error event."""
++        await self._send((None, "submit_command_async", (session_id, type(command).__name__, command), {}))
++
++    async def check_health_async(self) -> None:
++        """Check native runtime health over IPC, beyond child-process liveness."""
++        if not self.is_alive():
++            raise EngineDeadError(self._failure or "Duplex engine process is not alive")
++        try:
++            await self._rpc("check_health", (), {})
++        except DuplexSessionError as exc:
++            raise EngineDeadError(str(exc)) from exc
++
++    def is_alive(self) -> bool:
++        return self._process.is_alive() and self._failure is None and not self._closed
++
++    async def get_outputs_async(self, timeout: float = 0.1) -> list[DuplexSessionEventMessage]:
++        """Poll lifecycle events for the frontend pump; session data uses local buffers."""
++        self.start()
++        assert self._start_task is not None
++        await asyncio.shield(self._start_task)
++        if not self.is_alive():
++            raise EngineDeadError(self._failure or "Duplex engine process exited")
++        try:
++            return [await asyncio.wait_for(self._outputs.get(), timeout)]
++        except (TimeoutError, asyncio.TimeoutError):
++            return []
++
++    async def _read(self) -> None:
++        """Resolve RPCs and apply invalidations and events in wire order.
++
++        Stale audio is discarded before local delivery. Session closure goes
++        through the frontend output pump; other events enter session buffers.
++        """
++        assert self._channel is not None
++        while True:
++            message = await self._channel.receive()
++            kind, *body = message
++            if kind == "result":
++                request_id, ok, value = body
++                future = self._pending.get(request_id)
++                if future is not None and not future.done():
++                    if not ok:
++                        future.set_exception(DuplexSessionError(value.pop("message"), **value))
++                    else:
++                        if value is not None:
++                            value = msgspec.convert(value, type=DuplexControlResultMessage)
++                        future.set_result(value)
++            elif kind == "invalidate":
++                session_id, response_id, epoch = body
++                if (buffer := self._buffers.get(session_id)) is not None:
++                    epochs = self._invalidated.setdefault(session_id, {})
++                    epochs[response_id] = max(epoch, epochs.get(response_id, -1))
++                    buffer.invalidate(response_id, epoch)
++            elif kind == "event":
++                session_id, name, data = body
++                event: events.DuplexEvent = msgspec.convert(data, type=_EVENT_TYPES[name])
++                buffer = self._buffers.get(session_id)
++                if isinstance(event, AudioDelta) and event.epoch is not None and event.response_id is not None:
++                    if event.epoch <= self._invalidated.get(session_id, {}).get(event.response_id, -1):
++                        continue
++                if isinstance(event, SessionClosed):
++                    self._buffers.pop(session_id, None)
++                    self._invalidated.pop(session_id, None)
++                    if buffer is not None:
++                        self._outputs.put_nowait(DuplexSessionEventMessage(session_id=session_id, event=event))
++                elif buffer is not None:
++                    try:
++                        buffer.put(event)
++                    except DuplexOutputOverflowError:
++                        self._overflow_session(session_id, buffer)
++                    if isinstance(event, ResponseDone) and event.response_id is not None:
++                        self._invalidated.get(session_id, {}).pop(event.response_id, None)
++            else:
++                raise RuntimeError(f"Unknown duplex IPC message: {kind}")
++
++    def _overflow_session(self, session_id: str, buffer: DuplexOutputBuffer) -> None:
++        """Close the overflowing frontend session and asynchronously release it in the worker."""
++        self._buffers.pop(session_id, None)
++        self._invalidated.pop(session_id, None)
++        with suppress(DuplexOutputOverflowError):
++            buffer.put(error_event("server_error", "Frontend pending output limit exceeded"))
++        self._outputs.put_nowait(
++            DuplexSessionEventMessage(
++                session_id=session_id, event=SessionClosed(session_id=session_id, reason="frontend_output_overflow")
++            )
++        )
++
++        async def release() -> None:
++            try:
++                await self.close_session_async(session_id, reason="frontend_output_overflow")
++            except DuplexSessionError:
++                logger.exception("Failed to release overflowed duplex session %s", session_id)
++
++        task = asyncio.create_task(release())
++        self._cleanup_tasks.add(task)
++        task.add_done_callback(self._cleanup_tasks.discard)
++
++    async def aclose(self) -> None:
++        """Request graceful worker cleanup for up to 30 seconds, then ensure termination."""
++        if self._closed:
++            return
++
++        async def graceful() -> None:
++            if self._cleanup_tasks:
++                await asyncio.gather(*self._cleanup_tasks, return_exceptions=True)
++            await self._send((None, "shutdown", (), {}))
++            while self._process.is_alive() and self._failure is None:
++                await asyncio.sleep(0.02)
++
++        try:
++            with suppress(TimeoutError, asyncio.TimeoutError, DuplexSessionError):
++                await asyncio.wait_for(graceful(), 30)
++        finally:
++            self.shutdown(timeout=0)
++
++    def shutdown(self, timeout: float | None = None) -> None:
++        """Idempotently close IPC and join the child, escalating to process-group signals."""
++        if self._closed:
++            return
++        self._closed = True
++        self._fail("shutdown")
++        for task in self._tasks:
++            task.cancel()
++        if self._start_task is not None:
++            self._start_task.cancel()
++        for task in self._cleanup_tasks:
++            task.cancel()
++        self._socket.close()
++        if self._process.pid is not None:
++            self._process.join(timeout=5 if timeout is None else timeout)
++            with suppress(ProcessLookupError):
++                os.killpg(self._process.pid, signal.SIGTERM)
++            self._process.join(timeout=5)
++            if self._process.is_alive():
++                # setsid may not have run if the child failed during import.
++                with suppress(ProcessLookupError):
++                    os.killpg(self._process.pid, signal.SIGKILL)
++                self._process.kill()
++                self._process.join(timeout=5)
++            from prometheus_client import multiprocess
++
++            multiprocess.mark_process_dead(self._process.pid)
+diff --git a/vllm_omni/entrypoints/async_omni_base.py b/vllm_omni/entrypoints/async_omni_base.py
+index 359659fd2..ed61e0725 100644
+--- a/vllm_omni/entrypoints/async_omni_base.py
++++ b/vllm_omni/entrypoints/async_omni_base.py
+@@ -107,11 +107,7 @@ class AsyncOmniBase(OmniBase):
+ 
+     def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
+         OmniBase.__init__(self, model=model, **kwargs)
+-        self.final_output_task: asyncio.Task | None = None
+-        self.event_resolver = AsyncEventResolver(orchestrator=self)
+-        self.config_path = self.engine.config_path
+-        self.input_processor = self.engine.input_processor
+-        self.endpoint_restrictions = self.engine.endpoint_restrictions
++        self._initialize_async_frontend()
+ 
+         stage_index = self._get_comprehension_stage_index()
+         if stage_index is None:
+@@ -126,6 +122,15 @@ class AsyncOmniBase(OmniBase):
+                 renderer = renderer_from_config(vllm_config)
+             self.io_processor = get_io_processor(vllm_config, renderer, io_processor_plugin)
+ 
++    def _initialize_async_frontend(self) -> None:
++        """Attach engine metadata and the shared output pump without renderers."""
++        self.final_output_task: asyncio.Task | None = None
++        self.event_resolver = AsyncEventResolver(orchestrator=self)
++        self.config_path = self.engine.config_path
++        self.input_processor = self.engine.input_processor
++        self.endpoint_restrictions = self.engine.endpoint_restrictions
++        self.io_processor = None
++
+     # ==================== Subclass seam ====================
+ 
+     def _route_engine_message(self, msg: Any) -> bool:
+@@ -187,7 +192,10 @@ class AsyncOmniBase(OmniBase):
+ 
+     @property
+     def vllm_config(self):
+-        """Return the vLLM config for the comprehension stage when present."""
++        """Return engine-provided frontend config, or select a local stage's config."""
++        get_config = getattr(self.engine, "get_frontend_vllm_config", None)
++        if get_config is not None:
++            return get_config()
+         stage_index = self._get_comprehension_stage_index()
+         if stage_index is None:
+             return None
+@@ -198,7 +206,10 @@ class AsyncOmniBase(OmniBase):
+         return self.vllm_config
+ 
+     def get_diffusion_od_config(self) -> Any | None:
+-        """Return the diffusion-stage config when the pipeline has one."""
++        """Return engine-provided frontend config, or inspect local diffusion clients."""
++        get_config = getattr(self.engine, "get_frontend_diffusion_od_config", None)
++        if get_config is not None:
++            return get_config()
+         saw_diffusion_stage = any(stage_config.stage_type == "diffusion" for stage_config in self.engine.stage_configs)
+         for stage_client in self.engine.stage_clients:
+             if getattr(stage_client, "stage_type", None) != "diffusion":
+@@ -603,8 +614,12 @@ class AsyncOmniBase(OmniBase):
+ 
+     # The async entrypoints expose the synchronous base health check as an awaitable.
+     async def check_health(self) -> None:  # type: ignore[override]
+-        """Check engine health by verifying the Orchestrator process is alive."""
+-        OmniBase.check_health(self)
++        """Use an engine's async health check, or inspect its local stage pools."""
++        check_health = getattr(self.engine, "check_health_async", None)
++        if check_health is not None:
++            await check_health()
++        else:
++            OmniBase.check_health(self)
+ 
+     # ==================== Shutdown ====================
+ 
+diff --git a/vllm_omni/entrypoints/cli/serve.py b/vllm_omni/entrypoints/cli/serve.py
+index a36e8912c..c59fc3cbf 100644
+--- a/vllm_omni/entrypoints/cli/serve.py
++++ b/vllm_omni/entrypoints/cli/serve.py
+@@ -450,6 +450,11 @@ class OmniServeCommand(CLISubcommand):
+             default=None,
+             help="Path to a deploy config YAML (new format with stages/engine_args).",
+         )
++        omni_config_group.add_argument(
++            "--duplex-engine-backend-as-process",
++            action="store_true",
++            help="Run the duplex runtime in a separate process to isolate the frontend GIL; serves sessions only.",
++        )
+         omni_config_group.add_argument(
+             "--strategy-config",
+             type=str,
+diff --git a/vllm_omni/entrypoints/duplex/warmup.py b/vllm_omni/entrypoints/duplex/warmup.py
+index 560a475ff..7d97a4ee7 100644
+--- a/vllm_omni/entrypoints/duplex/warmup.py
++++ b/vllm_omni/entrypoints/duplex/warmup.py
+@@ -20,6 +20,7 @@ import math
+ import struct
+ import time
+ import uuid
++from dataclasses import dataclass
+ from io import BytesIO
+ from typing import TYPE_CHECKING, TypedDict, cast
+ 
+@@ -28,6 +29,8 @@ import pybase64 as base64
+ from vllm.logger import init_logger
+ 
+ if TYPE_CHECKING:
++    from vllm_omni.engine.duplex.config import DuplexCapabilities
++    from vllm_omni.engine.duplex.process_engine import ProcessDuplexEngineClient
+     from vllm_omni.entrypoints.duplex_omni import DuplexOmni
+ 
+ logger = init_logger(__name__)
+@@ -54,8 +57,25 @@ class _WarmupAudioAppendKwargs(TypedDict, total=False):
+     video_frames: list[str]
+ 
+ 
++@dataclass(frozen=True)
++class _ProcessWarmupProfile:
++    """Serializable startup facts, without loading a model plugin in the API process."""
++
++    engine: ProcessDuplexEngineClient
++
++    def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
++        return self.engine.duplex_capabilities
++
++    def silence_unit_payload(self) -> dict[str, object]:
++        return dict(self.engine.metadata.warmup_audio)
++
++
+ def lookup_duplex_plugin(engine_client: object) -> object | None:
++    from vllm_omni.engine.duplex.process_engine import ProcessDuplexEngineClient
++
+     engine = getattr(engine_client, "engine", None)
++    if isinstance(engine, ProcessDuplexEngineClient):
++        return _ProcessWarmupProfile(engine)
+     plugin = getattr(engine, "plugin", None) if engine is not None else None
+     if plugin is None:
+         plugin = getattr(engine_client, "plugin", None)
+diff --git a/vllm_omni/entrypoints/duplex_omni.py b/vllm_omni/entrypoints/duplex_omni.py
+index 1e297aaff..69e3ce54f 100644
+--- a/vllm_omni/entrypoints/duplex_omni.py
++++ b/vllm_omni/entrypoints/duplex_omni.py
+@@ -26,13 +26,15 @@ Example::
+ from __future__ import annotations
+ 
+ import asyncio
+-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
++import weakref
++from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
+ from contextlib import AbstractContextManager, suppress
+ from typing import Any
+ from uuid import uuid4
+ 
+ from vllm.logger import init_logger
+ 
++from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
+ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+ from vllm_omni.engine.duplex import commands as duplex_commands
+ from vllm_omni.engine.duplex.commands import DuplexCommand
+@@ -44,8 +46,10 @@ from vllm_omni.engine.duplex.messages import (
+     DuplexSessionError,
+     DuplexSessionEventMessage,
+ )
++from vllm_omni.engine.duplex.process_engine import ProcessDuplexEngineClient
+ from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
+ from vllm_omni.entrypoints.async_omni import AsyncOmni
++from vllm_omni.outputs import OmniRequestOutput
+ 
+ logger = init_logger(__name__)
+ 
+@@ -55,6 +59,28 @@ _DEFAULT_CONTROL_TIMEOUT_S = 10.0
+ _DEFAULT_OPEN_TIMEOUT_S = 60.0
+ 
+ 
++class _ProcessWorkerRuntime:
++    """Entrypoint-owned factory adapter; no frontend object is sent over IPC."""
++
++    def __init__(self, model: str, options: dict[str, Any]) -> None:
++        from vllm.plugins import load_general_plugins
++
++        from vllm_omni.entrypoints.duplex.warmup import warmup_silence_unit
++
++        load_general_plugins()
++        self.runtime = DuplexOmni(model=model, **options)
++        self.model = self.runtime.model
++        self.engine = self.runtime.engine
++        assert isinstance(self.engine, DuplexOmniEngine)
++        self.process_warmup_audio = warmup_silence_unit(self.engine.plugin)
++
++    async def check_health(self) -> None:
++        await self.runtime.check_health()
++
++    def shutdown(self) -> None:
++        self.runtime.shutdown()
++
++
+ class DuplexSessionHandle:
+     """Client-side view of one engine-resident duplex session.
+ 
+@@ -311,19 +337,42 @@ class DuplexOmni(AsyncOmni):
+ 
+     Construct it like ``AsyncOmni``. The pipeline must declare
+     ``duplex_plugin`` and the deploy config ``session_mode: duplex``; the
+-    engine raises at startup otherwise. There is no ``generate()``: duplex
+-    serving is session-only.
++    engine raises at startup otherwise. ``duplex_engine_backend_as_process=True``
++    isolates the runtime from the frontend GIL and restricts this deployment
++    to sessions. The default ``False`` also permits model-supported chat.
+     """
+ 
+-    engine: DuplexOmniEngine
++    session_only: bool = False
++    final_output_task: asyncio.Task[None] | None
++    engine: DuplexOmniEngine | ProcessDuplexEngineClient  # type: ignore[assignment]
+ 
+     def _create_engine(self, **engine_kwargs: Any) -> DuplexOmniEngine:
+         from vllm_omni.entrypoints.duplex.audio_encoding import encode_audio
+ 
+         return DuplexOmniEngine(duplex_audio_encoder=encode_audio, **engine_kwargs)
+ 
+-    def __init__(self, model: str = "", *args: Any, **kwargs: Any) -> None:
+-        super().__init__(model, *args, **kwargs)
++    def __init__(
++        self,
++        model: str = "",
++        *args: Any,
++        duplex_engine_backend_as_process: bool = False,
++        **kwargs: Any,
++    ) -> None:
++        self.session_only = duplex_engine_backend_as_process
++        if self.session_only:
++            if args:
++                raise TypeError("The process duplex backend accepts keyword engine options only")
++            self.engine = ProcessDuplexEngineClient(model, kwargs, factory=_ProcessWorkerRuntime)
++            self.model = self.engine.metadata.model
++            self._initialize_output_state()
++            self._initialize_async_frontend()
++            self.endpoint_restrictions += tuple(
++                EndpointRestriction(capability, "The process duplex backend serves sessions only")
++                for capability in OmniServingCapability
++            )
++            self._weak_finalizer = weakref.finalize(self, self.engine.shutdown)
++        else:
++            super().__init__(model, *args, **kwargs)
+         self._handles: dict[str, DuplexSessionHandle] = {}
+         #: Rollbacks of resumes whose caller was cancelled mid-RPC (see ``resume_session``).
+         self._resume_compensations: set[asyncio.Task[None]] = set()
+@@ -331,6 +380,23 @@ class DuplexOmni(AsyncOmni):
+         #: whose answers keep timing out.
+         self._resume_replay_backoff_s: tuple[float, float] = (0.5, 5.0)
+ 
++    async def generate(self, *args: Any, **kwargs: Any) -> AsyncGenerator[OmniRequestOutput, None]:
++        if self.session_only:
++            raise NotImplementedError("The process duplex backend serves sessions only; use open_session()")
++        async for output in super().generate(*args, **kwargs):
++            yield output
++
++    async def aclose(self) -> None:
++        """Release sessions and flush the process shutdown before joining it."""
++        try:
++            await self.close_all_sessions()
++        finally:
++            try:
++                if isinstance(self.engine, ProcessDuplexEngineClient):
++                    await self.engine.aclose()
++            finally:
++                self.shutdown()
++
+     # ---- deployment facts ----
+ 
+     @property
+@@ -651,7 +717,14 @@ class DuplexOmni(AsyncOmni):
+         self._handles.clear()
+         for compensation in list(self._resume_compensations):
+             compensation.cancel()
+-        super().shutdown(timeout)
++        if isinstance(self.engine, ProcessDuplexEngineClient):
++            if self.final_output_task is not None:
++                self.final_output_task.cancel()
++                self.final_output_task = None
++            self.engine.shutdown(timeout)
++            self._weak_finalizer.detach()
++        else:
++            super().shutdown(timeout)
+ 
+ 
+ __all__ = ["DuplexOmni", "DuplexSessionHandle"]
+diff --git a/vllm_omni/entrypoints/omni_base.py b/vllm_omni/entrypoints/omni_base.py
+index ecd1c8ee2..b4875eff6 100644
+--- a/vllm_omni/entrypoints/omni_base.py
++++ b/vllm_omni/entrypoints/omni_base.py
+@@ -202,7 +202,7 @@ class OmniBase(PDDisaggregationMixin):
+         if "log_requests" in kwargs:
+             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
+         model = omni_snapshot_download(model)
+-        self.__dict__["_name"] = self.__class__.__name__
++        self._initialize_output_state()
+         self.model = model
+         self.log_stats = log_stats
+         self.collect_stage_metrics = collect_stage_metrics
+@@ -241,7 +241,6 @@ class OmniBase(PDDisaggregationMixin):
+         # (explicit ``False``) is not fallen-back-through by ``or``.
+         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
+ 
+-        self.request_states: dict[str, ClientRequestState] = {}
+         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
+ 
+         self.default_sampling_params_list = self.engine.default_sampling_params_list
+@@ -263,6 +262,11 @@ class OmniBase(PDDisaggregationMixin):
+         # PD disaggregation state (detects if a prefill/decode stage pair is configured)
+         self._init_pd_state()
+ 
++    def _initialize_output_state(self) -> None:
++        """Bookkeeping shared by generation and session-only frontends."""
++        self.__dict__["_name"] = self.__class__.__name__
++        self.request_states: dict[str, ClientRequestState] = {}
++
+     def _create_engine(self, **engine_kwargs: Any) -> OmniEngineBase:
+         """Construct this entrypoint's engine (``AsyncOmniEngine`` for turn-based use)."""
+         raise NotImplementedError
+diff --git a/vllm_omni/entrypoints/openai/api_server.py b/vllm_omni/entrypoints/openai/api_server.py
+index 904754308..cf91c31f0 100644
+--- a/vllm_omni/entrypoints/openai/api_server.py
++++ b/vllm_omni/entrypoints/openai/api_server.py
+@@ -517,7 +517,7 @@ async def omni_run_server_worker(
+         is_pure_diffusion = vllm_config is None
+         if is_pure_diffusion:
+             logger.info(
+-                "Starting vLLM API server (pure diffusion mode) on %s",
++                "Starting vLLM API server without a frontend LLM configuration on %s",
+                 listen_address,
+             )
+             # The vLLM 0.27 launcher's shutdown path reads
+@@ -753,9 +753,14 @@ async def build_async_omni_from_stage_config(
+             kwargs.setdefault("log_stats", True)
+         if client_config is not None:
+             kwargs["client_config"] = client_config
++        backend_as_process = kwargs.pop("duplex_engine_backend_as_process", False)
+         if _should_serve_duplex(model, kwargs):
++            if backend_as_process:
++                kwargs["duplex_engine_backend_as_process"] = True
+             async_omni = DuplexOmni(model=model, **kwargs)
+         else:
++            if backend_as_process:
++                raise ValueError("--duplex-engine-backend-as-process requires a session_mode: duplex deployment")
+             async_omni = AsyncOmni(model=model, **kwargs)
+ 
+         # # Don't keep the dummy data in memory
+@@ -764,7 +769,10 @@ async def build_async_omni_from_stage_config(
+         yield async_omni
+     finally:
+         if async_omni:
+-            async_omni.shutdown()
++            if isinstance(async_omni, DuplexOmni) and backend_as_process:
++                await async_omni.aclose()
++            else:
++                async_omni.shutdown()
+ 
+ 
+ async def _init_duplex_app_state(
+@@ -778,11 +786,14 @@ async def _init_duplex_app_state(
+     """Minimal app state for a duplex server: only the surfaces a duplex session backs."""
+     state.vllm_config = vllm_config
+     state.diffusion_engine = None
+-    state.openai_serving_models = OpenAIServingModels(
+-        engine_client=engine_client,  # type: ignore[arg-type]
+-        base_model_paths=base_model_paths,
+-        lora_modules=None,
+-    )
++    if engine_client.session_only:
++        state.openai_serving_models = openai_models_serving.SessionServingModels(base_model_paths)
++    else:
++        state.openai_serving_models = OpenAIServingModels(
++            engine_client=engine_client,  # type: ignore[arg-type]
++            base_model_paths=base_model_paths,
++            lora_modules=None,
++        )
+     state.serving_tokenization = None
+     state.serving_tokens = None
+     # Replaced by the chat init below when the model serves chat.
+@@ -843,7 +854,7 @@ async def _init_duplex_chat(
+     answering badly. ``endpoint_restrictions`` remains the per-deployment
+     opt-out on top of this.
+     """
+-    if not engine_client.duplex_capabilities.supports_chat_completions:
++    if engine_client.session_only or not engine_client.duplex_capabilities.supports_chat_completions:
+         return None
+     supported_tasks: set[str] = {"generate"}
+     if hasattr(engine_client, "get_supported_tasks"):
+diff --git a/vllm_omni/entrypoints/openai/models/serving.py b/vllm_omni/entrypoints/openai/models/serving.py
+index 9917098f8..beda57655 100644
+--- a/vllm_omni/entrypoints/openai/models/serving.py
++++ b/vllm_omni/entrypoints/openai/models/serving.py
+@@ -57,3 +57,21 @@ class _DiffusionServingModels:
+                 for base_model in self._base_model_paths
+             ]
+         )
++
++
++class SessionServingModels:
++    """Model listing for session-only serving, without LLM renderer setup."""
++
++    def __init__(self, base_model_paths: list[BaseModelPath]) -> None:
++        self.base_model_paths = base_model_paths
++
++    def is_base_model(self, model_name: str) -> bool:
++        return any(model.name == model_name for model in self.base_model_paths)
++
++    async def show_available_models(self) -> ModelList:
++        return ModelList(
++            data=[
++                ModelCard(id=model.name, root=model.model_path, permission=[ModelPermission()])
++                for model in self.base_model_paths
++            ]
++        )

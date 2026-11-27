@@ -1,0 +1,83 @@
+pipeline: personaplex
+session_mode: duplex
+duplex_session:
+  max_sessions: 96
+  disconnect_grace_s: 1
+  warmup_frames: -1
+model_runner: v1
+async_chunk: true
+dtype: bfloat16
+trust_remote_code: true
+distributed_executor_backend: uni
+enable_prefix_caching: false
+quantization: fp8_per_tensor
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      codec_chunk_frames: 2
+      initial_codec_chunk_frames: 1
+
+stages:
+  - stage_id: 0
+    attention_backend: FLASHINFER
+    kv_cache_dtype: fp8_e4m3
+    devices: "0"
+    max_num_seqs: 96
+    skip_tokenizer_init: true
+    async_scheduling: false
+    enforce_eager: false
+    gpu_memory_utilization: 0.75
+    kv_cache_memory_bytes: 76235669504
+    max_num_batched_tokens: 4096
+    max_model_len: 3000
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 48, 64, 72, 80, 88, 96]
+      max_cudagraph_capture_size: 96
+    hf_overrides:
+      mimi_cuda_graphs: true
+      depformer_cuda_graphs: true
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_k: 1
+      max_tokens: 3000
+      seed: 42
+      repetition_penalty: 1.0
+    engine_extras:
+      additional_config:
+        generation_always_wait_target_batch: true
+        generation_min_batch_size: 64
+        generation_max_wait_ms: 10
+
+  - stage_id: 1
+    devices: "0"
+    max_num_seqs: 96
+    skip_tokenizer_init: true
+    async_scheduling: true
+    # Mimi owns its CUDA graphs, including the 96 session rows + scratch row.
+    # Outer vLLM graph capture is unnecessary for this generation worker.
+    enforce_eager: true
+    gpu_memory_utilization: 0.15
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    hf_overrides:
+      mimi_cuda_graphs: true
+      mimi_decode_tf32: true
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0
+    engine_extras:
+      additional_config:
+        generation_always_wait_target_batch: true
+        generation_min_batch_size: 64
+        generation_max_wait_ms: 10
