@@ -1,0 +1,2029 @@
+diff --git a/docs/design/feature/async_chunk.md b/docs/design/feature/async_chunk.md
+index e004cdec3..2c3db4c60 100644
+--- a/docs/design/feature/async_chunk.md
++++ b/docs/design/feature/async_chunk.md
+@@ -309,8 +309,77 @@ Single-stage pipelines without a connector set the same three keys in the
+ stage's `additional_config`. When both sources are present, connector `extra`
+ overrides `additional_config` per key. The policy remains disabled by default.
+ 
++#### Coalescing AR Execution Batches
++
++To coalesce both admissions and ongoing AR work, use these settings instead
++of `ar_prefill_admission_*`:
++
++```yaml
++generation_min_batch_size: 16
++generation_max_wait_ms: 6
++generation_always_wait_target_batch: false
++```
++
++Both AR and generation schedulers accept these keys in stage
++`engine_extras.additional_config` or connector `extra`, with connector values
++taking precedence for compatibility. Waiting is disabled by default and requires
++a batch target greater than one and a positive wait bound. Enabling it together
++with any nonzero `ar_prefill_admission_*` setting raises a configuration error.
++The legacy admission-only policy retains its existing behavior when execution
++coalescing is disabled.
++
++For both AR and generation schedulers, `generation_min_batch_size` must be in
++`[1, max_num_seqs]`, including when batch waiting is disabled.
++
++The AR gate counts distinct input-ready streams, runnable waiting requests,
++and running requests with outstanding token work. In-flight execution alone
++does not disqualify an async AR continuation. Input-blocked and finished requests
++do not count. This is a candidate count: upstream token budgets and allocation
++constraints can produce a smaller execution batch.
++
++Ready work executes when the target is reached or a monotonic wait bound
++expires. Below the configured target population, work executes immediately
++unless `generation_always_wait_target_batch: true` caps the target at the
++registered request count and retains the wait. The deadline does not restart
++when more requests become ready; an empty candidate set clears it. Final inputs
++share the bounded window.
++
++Both V1 and V2 support this policy with TP1/PP1 and
++`generation_coalescing_policy: fixed`. Both revisit readiness on scheduler ticks,
++so dispatch includes tick granularity; neither blocks the scheduler thread.
++Input/control processing continues during the wait, and deferred steps schedule
++zero tokens before any allocation. AR does not support the generation
++scheduler's `idle_wait`, regular-batch cap or express scheduling features.
++V1 retains persistent batch rows across coalescing-only deferred steps while
++still cleaning up finished requests, avoiding full token-history resends caused
++solely by the batch wait. Ordinary empty steps retain their existing behavior.
++
++The default readiness hook supports legacy async-chunk receivers, native
++async-chunk coordinators, and orchestrator-fed Stage 0. For Stage 0 without a
++connector receive path, queued `WAITING` and `PREEMPTED` requests count as
++input-ready; streams parked for another append do not. Unsupported input sources
++disable AR batch waiting with a warning. Other input sources can override
++`OmniSchedulerMixin._get_coalescing_ready_request_ids()`; it must return a set,
++including an empty set before input arrives, and be safe during initialization.
++
+ ### Code2Wav Batch Configuration
+ 
++Generation stages use the same `generation_*` settings, configuration precedence,
++and batch-target/timeout policy described in
++[Coalescing AR Execution Batches](#coalescing-ar-execution-batches). Generation
++counts input-ready requests with no execution in flight. Runner support differs:
++
++- **V1:** stateful and stateless TP1/PP1 stages support the `fixed` policy.
++  Readiness is polled on scheduler ticks without blocking or consuming deferred
++  inputs. Async-chunk receivers and orchestrator-fed Stage 0 are supported;
++  other input sources can use the readiness hook described above.
++- **Native MRV2:** requires a stateful TP1/PP1 stage and retains notification-inbox
++  waiting, including the MRV2-only `idle_wait` policy.
++
++V1 inputs yielding `pending_generation` continue without another batch wait
++for the same input. `generation_max_regular_batch` caps execution batch size;
++first-chunk express scheduling retains its native MRV2 scope.
++
+ For optimal performance with async_chunk, the code2wav stage should be configured with batching:
+ 
+ ```yaml
+diff --git a/tests/core/sched/test_ar_generation_coalescing.py b/tests/core/sched/test_ar_generation_coalescing.py
+new file mode 100644
+index 000000000..0f92010e8
+--- /dev/null
++++ b/tests/core/sched/test_ar_generation_coalescing.py
+@@ -0,0 +1,443 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
++"""AR execution coalescing uses a bounded gate, separate from admission."""
++
++import pytest
++from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
++from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
++from vllm.v1.core.sched.interface import PauseState
++from vllm.v1.core.sched.output import SchedulerOutput
++from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
++from vllm.v1.request import RequestStatus
++
++from tests.core.sched.test_generation_scheduler_atomic_chunk import FakeAdapter, _make_request
++from tests.core.sched.test_generation_scheduler_init import _config
++from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler, VLLMScheduler
++from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
++from vllm_omni.outputs import OmniConnectorOutput
++
++pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
++
++
++def _init_policies(s):
++    extra = s._get_scheduler_extra_config()
++    s._init_prefill_admission_policy(extra)
++    s._init_generation_coalescing(extra)
++
++
++def scheduler(*, native=False, extras=None, population=4, async_scheduling=False):
++    scheduler_cls = OmniARAsyncScheduler if async_scheduling else OmniARScheduler
++    s = scheduler_cls.__new__(scheduler_cls)
++    s.vllm_config = _config(native=native, extras=extras)
++    s.max_num_running_reqs = 128
++    s._native_data_plane = native
++    s.chunk_transfer_adapter = None if native else FakeAdapter()
++    s.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True) if native else None
++    s._pause_state = PauseState.UNPAUSED
++    s.requests = {str(i): _make_request(str(i), 8) for i in range(population)}
++    s.running = []
++    s.policy = SchedulingPolicy.FCFS
++    s.waiting = create_request_queue(s.policy)
++    s.kv_holding_waiting = create_request_queue(s.policy)
++    s.deferred_waiting = set()
++    s.use_v2_model_runner = native
++    s.max_num_active_reqs = 128
++    s.max_num_scheduled_tokens = 128
++    s.prev_step_scheduled_req_ids = set()
++    _init_policies(s)
++    return s
++
++
++def knobs(**overrides):
++    return {"generation_min_batch_size": 4, "generation_max_wait_ms": 12, **overrides}
++
++
++@pytest.mark.parametrize("native", [False, True])
++@pytest.mark.parametrize("policy", ["generation", "admission", "conflict"])
++def test_constructor_initializes_both_policies(monkeypatch, mocker, native, policy):
++    def upstream_init(self, config):
++        self.vllm_config = config
++        self.max_num_running_reqs = config.scheduler_config.max_num_seqs
++        self.kv_cache_manager = mocker.Mock(spec=KVCacheManager)
++
++    monkeypatch.setattr(VLLMScheduler, "__init__", upstream_init)
++    mocker.patch("vllm_omni.core.sched.omni_ar_scheduler.install_decode_allocate_fast_path")
++    mocker.patch("vllm_omni.core.sched.omni_scheduler_mixin.OmniChunkTransferAdapter", return_value=FakeAdapter())
++    extras = knobs() if policy != "admission" else {}
++    if policy != "generation":
++        extras.update(ar_prefill_admission_min_batch=4, ar_prefill_admission_max_wait_ms=12)
++    config = _config(native=native, extras=extras)
++    if policy == "conflict":
++        with pytest.raises(ValueError, match="cannot be enabled together"):
++            OmniARScheduler(config)
++    else:
++        s = OmniARScheduler(config)
++        assert s._generation_min_batch_size == (4 if policy == "generation" else 1)
++        assert s._prefill_admission_min_batch == (4 if policy == "admission" else 0)
++
++
++@pytest.mark.parametrize("native", [False, True])
++def test_configuration_supports_both_runners_and_additional_config(native):
++    s = scheduler(native=native)
++    s.vllm_config.additional_config = knobs()
++    _init_policies(s)
++    assert s._generation_min_batch_size == 4
++    assert s._generation_max_wait_s == 0.012
++    assert s._generation_always_wait_target_batch is False
++
++
++@pytest.mark.parametrize(
++    "key,value,message",
++    [
++        ("generation_min_batch_size", 0, "max_num_seqs"),
++        ("generation_min_batch_size", 129, "max_num_seqs"),
++        ("generation_max_wait_ms", -1, "finite and nonnegative"),
++        ("generation_max_wait_ms", float("nan"), "finite and nonnegative"),
++        ("generation_max_wait_ms", float("inf"), "finite and nonnegative"),
++        ("generation_always_wait_target_batch", "false", "boolean"),
++        ("generation_coalescing_policy", "idle_wait", "fixed"),
++    ],
++)
++def test_rejects_invalid_configuration(key, value, message):
++    with pytest.raises(ValueError, match=message):
++        scheduler(extras=knobs(**{key: value}))
++
++
++@pytest.mark.parametrize("max_wait_ms", [0, 12])
++def test_batch_size_upper_bound_applies_even_when_waiting_is_disabled(max_wait_ms):
++    with pytest.raises(ValueError, match="max_num_seqs"):
++        scheduler(extras=knobs(generation_min_batch_size=129, generation_max_wait_ms=max_wait_ms))
++    s = scheduler(extras=knobs(generation_min_batch_size=128, generation_max_wait_ms=max_wait_ms))
++    assert s._generation_min_batch_size == 128
++    assert s._generation_batch_deadline is None
++
++
++@pytest.mark.parametrize(
++    "old_knobs",
++    [
++        {"ar_prefill_admission_min_batch": 4, "ar_prefill_admission_max_wait_ms": 12},
++        {"ar_prefill_admission_max_wait_ms": 12},
++        {"ar_prefill_admission_min_running": 2},
++    ],
++)
++def test_rejects_combining_admission_and_execution_coalescing(old_knobs):
++    with pytest.raises(ValueError, match="cannot be enabled together"):
++        scheduler(extras=knobs(**old_knobs))
++
++
++def test_deadline_does_not_restart_on_partial_arrivals(monkeypatch):
++    clock = [10.0]
++    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
++    s = scheduler(extras=knobs())
++    assert s._should_defer_ar_generation({"0"})
++    clock[0] += 0.006
++    assert s._should_defer_ar_generation({"0", "1"})
++    assert s._generation_batch_deadline == pytest.approx(10.012)
++    clock[0] += 0.006
++    assert not s._should_defer_ar_generation({"0", "1"})
++    assert s._generation_batch_deadline is None
++
++
++@pytest.mark.parametrize(
++    "always_wait,population,ready,wait",
++    [
++        (False, 4, 1, True),
++        (False, 4, 4, False),
++        (False, 3, 1, False),
++        (True, 3, 1, True),
++        (True, 3, 3, False),
++        (True, 4, 0, False),
++    ],
++)
++def test_batch_target_policy(always_wait, population, ready, wait):
++    s = scheduler(extras=knobs(generation_always_wait_target_batch=always_wait), population=population)
++    assert s._should_defer_ar_generation({str(i) for i in range(ready)}) is wait
++
++
++@pytest.mark.parametrize("native", [False, True])
++def test_candidates_combine_input_prefill_and_continuation_without_duplicates(native):
++    s = scheduler(native=native, extras=knobs(), population=7)
++    receiver = s.input_coordinator if native else s.chunk_transfer_adapter
++    receiver.requests_with_ready_chunks.update({"0", "1", "4", "5", "gone"})
++    # The same stream appears in the input set and waiting queue.
++    s.waiting.add_request(s.requests["0"])
++    for i in (1, 2, 3):
++        request = s.requests[str(i)]
++        request.status = RequestStatus.RUNNING
++        request.num_computed_tokens = request.num_prompt_tokens
++        s.running.append(request)
++    # A normal continuation and an async continuation both have token work.
++    s.requests["1"].append_output_token_ids(1)
++    s.requests["2"].num_output_placeholders = 1
++    s.requests["2"].num_in_flight_tokens = 1
++    # Running request 3 has no work; 4 is parked; 5 is finished.
++    s.requests["4"].status = RequestStatus.WAITING_FOR_CHUNK
++    s.requests["5"].status = RequestStatus.FINISHED_ABORTED
++    s.requests["6"].status = RequestStatus.PREEMPTED
++    s.kv_holding_waiting.add_request(s.requests["6"])
++    assert s._get_ar_coalescing_ready_request_ids() == {"0", "1", "2", "6"}
++    assert receiver.requests_with_ready_chunks == {"0", "1", "4", "5", "gone"}
++
++
++def prepare_schedule_boundary(monkeypatch, s, *, fail=False):
++    """Keep the real AR gate; isolate upstream allocation and output packaging."""
++    for name in (
++        "_process_pending_omni_inputs",
++        "_resync_streaming_input_counter",
++        "_postprocess_omni_schedule_output",
++    ):
++        monkeypatch.setattr(s, name, lambda *args, **kwargs: None)
++    monkeypatch.setattr(s, "get_finished_requests_needing_kv_transfer", lambda: {})
++    monkeypatch.setattr(s, "_wrap_omni_scheduler_output", lambda output, **kwargs: output)
++    budgets = []
++
++    def upstream_schedule(self, throttle_prefills=False):
++        budgets.append(self.max_num_scheduled_tokens)
++        if fail:
++            raise RuntimeError("allocation failed")
++        output = SchedulerOutput.make_empty()
++        output.finished_req_ids = {"finished"}
++        if self.max_num_scheduled_tokens:
++            output.num_scheduled_tokens = {"0": 8}
++            output.total_num_scheduled_tokens = 8
++        return output
++
++    monkeypatch.setattr(VLLMScheduler, "schedule", upstream_schedule)
++    return budgets
++
++
++@pytest.mark.parametrize("native", [False, True])
++def test_schedule_defers_before_allocation_and_preserves_control_output(monkeypatch, native):
++    clock = [10.0]
++    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
++    s = scheduler(native=native, extras=knobs())
++    s.waiting.add_request(s.requests["0"])
++    budgets = prepare_schedule_boundary(monkeypatch, s)
++    assert s.schedule().finished_req_ids == {"finished"}
++    assert budgets == [0]
++    assert s.max_num_scheduled_tokens == 128
++    assert s.requests["0"].num_computed_tokens == 0
++    assert list(s.waiting) == [s.requests["0"]]
++    clock[0] += 0.012
++    assert s.schedule().num_scheduled_tokens == {"0": 8}
++    assert budgets == [0, 128]
++
++
++def test_schedule_restores_budget_on_upstream_exception(monkeypatch):
++    s = scheduler(extras=knobs())
++    s.waiting.add_request(s.requests["0"])
++    prepare_schedule_boundary(monkeypatch, s, fail=True)
++    with pytest.raises(RuntimeError, match="allocation failed"):
++        s.schedule()
++    assert s.max_num_scheduled_tokens == 128
++
++
++@pytest.mark.parametrize("tp,pp", [(2, 1), (1, 2)])
++def test_rejects_unsupported_topology(tp, pp):
++    s = scheduler()
++    s.vllm_config.parallel_config.tensor_parallel_size = tp
++    s.vllm_config.parallel_config.pipeline_parallel_size = pp
++    s.vllm_config.additional_config = knobs()
++    with pytest.raises(ValueError, match="TP1/PP1"):
++        _init_policies(s)
++
++
++@pytest.mark.parametrize("native", [False, True])
++def test_unsupported_input_source_disables_waiting(native):
++    s = scheduler(native=native)
++    s.vllm_config.additional_config = knobs()
++    s.chunk_transfer_adapter = None
++    s.input_coordinator = OmniSchedulingCoordinator(stage_id=0, async_chunk=True) if native else None
++    _init_policies(s)
++    assert s._generation_max_wait_s == 0
++
++
++@pytest.mark.parametrize("pause", [PauseState.PAUSED_ALL, PauseState.PAUSED_NEW])
++def test_pause_clears_coalescing_deadline(pause):
++    s = scheduler(extras=knobs())
++    assert s._should_defer_ar_generation({"0"})
++    s._pause_state = pause
++    assert not s._should_defer_ar_generation({"0"})
++    assert s._generation_batch_deadline is None
++
++
++def test_empty_candidates_clear_deadline(monkeypatch):
++    clock = [10.0]
++    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
++    s = scheduler(extras=knobs())
++    assert s._should_defer_ar_generation({"0"})
++    clock[0] += 0.006
++    assert not s._should_defer_ar_generation(set())
++    assert s._generation_batch_deadline is None
++    assert s._should_defer_ar_generation({"1"})
++    assert s._generation_batch_deadline == pytest.approx(10.018)
++
++
++@pytest.mark.parametrize("extras", [None, knobs(generation_min_batch_size=1), knobs(generation_max_wait_ms=0)])
++def test_disabled_coalescing_keeps_normal_budget(monkeypatch, extras):
++    s = scheduler(extras=extras)
++    s.waiting.add_request(s.requests["0"])
++    budgets = prepare_schedule_boundary(monkeypatch, s)
++    s.schedule()
++    assert budgets == [128]
++
++
++@pytest.mark.parametrize("native", [False, True])
++def test_new_ready_requests_release_before_deadline(monkeypatch, native):
++    clock = [10.0]
++    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
++    s = scheduler(native=native, extras=knobs())
++    s.waiting.add_request(s.requests["0"])
++    budgets = prepare_schedule_boundary(monkeypatch, s)
++    s.schedule()
++    clock[0] += 0.003
++    for i in range(1, 4):
++        s.waiting.add_request(s.requests[str(i)])
++    s.schedule()
++    assert budgets == [0, 128]
++    assert s._generation_batch_deadline is None
++    assert clock[0] == 10.003
++
++
++@pytest.mark.parametrize("native", [False, True])
++def test_cancellation_during_wait_releases_remaining_request(monkeypatch, native):
++    s = scheduler(native=native, extras=knobs())
++    s.waiting.add_request(s.requests["0"])
++    s.waiting.add_request(s.requests["1"])
++    budgets = prepare_schedule_boundary(monkeypatch, s)
++    s.schedule()
++    aborted = s.requests.pop("1")
++    aborted.status = RequestStatus.FINISHED_ABORTED
++    s.schedule()
++    assert budgets == [0, 128]
++    assert aborted not in s.waiting
++    assert s._generation_batch_deadline is None
++
++
++def test_native_notifications_update_readiness_before_gate(monkeypatch):
++    s = scheduler(native=True, extras=knobs())
++    s._init_omni_connector_output_inbox()
++    s._latest_omni_connector_output = None
++    s._outputs_awaiting_stage_payload = {}
++    for request in s.requests.values():
++        s.waiting.add_request(request)
++    process_inputs = s._process_pending_omni_inputs
++    budgets = prepare_schedule_boundary(monkeypatch, s)
++    monkeypatch.setattr(s, "_process_pending_omni_inputs", process_inputs)
++    s.enqueue_omni_connector_output(OmniConnectorOutput(chunk_ready_req_ids={"0"}))
++    s.schedule()
++    assert budgets == [0]
++    assert s.input_coordinator.requests_with_ready_chunks == {"0"}
++    assert s.requests["0"].num_computed_tokens == 0
++    assert s.requests["1"].status == RequestStatus.WAITING_FOR_CHUNK
++    s.enqueue_omni_connector_output(OmniConnectorOutput(chunk_ready_req_ids={"1", "2"}, chunk_finished_req_ids={"3"}))
++    s.schedule()
++    assert budgets == [0, 128]
++    assert s._generation_batch_deadline is None
++
++
++@pytest.mark.parametrize("source", ["override", "stage_zero"])
++def test_orchestrator_readiness_enables_ar_gate(monkeypatch, source):
++    s = scheduler()
++    ready: set[str] = set()
++    if source == "override":
++        monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: ready.copy())
++    else:
++        s.vllm_config.model_config.stage_id = 0
++    s.chunk_transfer_adapter = None
++    s.vllm_config.additional_config = knobs()
++    _init_policies(s)
++    assert s._generation_max_wait_s == 0.012
++    if source == "override":
++        s.requests["0"].status = RequestStatus.RUNNING
++        s.requests["0"].num_computed_tokens = s.requests["0"].num_prompt_tokens
++        s.running.append(s.requests["0"])
++    else:
++        s.waiting.add_request(s.requests["0"])
++    budgets = prepare_schedule_boundary(monkeypatch, s)
++    ready.add("0")
++    s.schedule()
++    assert budgets == [0]
++
++
++@pytest.mark.parametrize("native", [False, True])
++@pytest.mark.parametrize("async_scheduling", [False, True])
++@pytest.mark.parametrize("prompt_length", [8, 128])
++def test_real_upstream_empty_step_preserves_tokens_and_emits_finished_ids(
++    monkeypatch, mocker, native, async_scheduling, prompt_length
++):
++    clock = [10.0]
++    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
++    s = scheduler(native=native, extras=knobs(), async_scheduling=async_scheduling)
++    s.requests["0"] = _make_request("0", prompt_length)
++    s.waiting.add_request(s.requests["0"])
++    # Isolate input transport and payload packaging, retaining upstream schedule
++    # and accounting. Cache allocations must never run on a deferred step.
++    monkeypatch.setattr(s, "_process_pending_omni_inputs", lambda model_mode: None)
++    monkeypatch.setattr(s, "_postprocess_omni_schedule_output", lambda *args, **kwargs: None)
++    monkeypatch.setattr(s, "get_finished_requests_needing_kv_transfer", lambda: {})
++    s.current_step = 0
++    s.vllm_config.speculative_config = None
++    s.scheduler_config = s.vllm_config.scheduler_config
++    s.scheduler_config.max_num_batched_tokens = 128
++    s.scheduler_config.long_prefill_token_threshold = 0
++    s.adaptive_long_prefill_threshold = False
++    s.prefill_capacity_bound = False
++    s.max_num_encoder_input_tokens = 0
++    s.num_waiting_for_streaming_input = 0
++    s.lora_config = None
++    s.prev_step_scheduled_req_ids = {"0", "finished"}
++    s.finished_req_ids = {"finished"}
++    s.reset_preempted_req_ids = set()
++    s.num_spec_tokens = 0
++    s.dynamic_sd_lookup = None
++    s.log_stats = False
++    s.defer_block_free = False
++    s.connector = s.aux_output_connector = s.ec_connector = None
++    s.needs_kv_cache_zeroing = False
++    cache = mocker.Mock(spec=KVCacheManager)
++    cache.take_boundary_state_offloads.return_value = {}
++    cache.take_kv_cache_block_copies.return_value = ([], [])
++    cache.take_new_block_ids.return_value = []
++    s.kv_cache_manager = cache
++    encoder = mocker.Mock(spec=EncoderCacheManager)
++    encoder.get_freed_mm_hashes.return_value = []
++    encoder.get_manager_metadata.return_value = None
++    s.encoder_cache_manager = encoder
++    output = s.schedule()
++    assert output.num_scheduled_tokens == {}
++    assert output.finished_req_ids == {"finished"}
++    assert output.preserve_v1_batch is (not native)
++    assert s.prev_step_scheduled_req_ids == ({"0"} if not native else {"0", "finished"})
++    assert s.finished_req_ids == set()
++    cache.allocate_slots.assert_not_called()
++    assert s.requests["0"].num_computed_tokens == s.requests["0"].num_in_flight_tokens == 0
++    assert s.max_num_scheduled_tokens == 128
++    clock[0] += 0.006
++    assert not s.schedule().num_scheduled_tokens
++    assert s.prev_step_scheduled_req_ids == ({"0"} if not native else {"0", "finished"})
++    # On expiry the real upstream scheduler resumes allocation/accounting.
++    request = s.requests["0"]
++    s.waiting.remove_requests([request])
++    request.status = RequestStatus.RUNNING
++    request.num_computed_tokens = request.num_prompt_tokens
++    request.append_output_token_ids(1)
++    s.running.append(request)
++    s.max_model_len = 256
++    s.num_sampled_tokens_per_step = 1
++    s.num_prefill_lookahead = 1
++    s.num_lookahead_tokens = 0
++    s.need_mamba_block_aligned_split = False
++    s.use_pp = False
++    s.decode_stagger = 1
++    s._inflight_prefills = set()
++    cache.allocate_slots.return_value = KVCacheBlocks(blocks=())
++    clock[0] += 0.006
++    output = s.schedule()
++    assert output.num_scheduled_tokens == {"0": 1}
++    assert not output.preserve_v1_batch
++    assert output.scheduled_cached_reqs.all_token_ids == {}
++    assert request.num_computed_tokens == request.num_prompt_tokens + 1
++    assert request.num_in_flight_tokens == 1
++    assert request.num_output_placeholders == int(async_scheduling)
++    cache.allocate_slots.assert_called_once()
+diff --git a/tests/core/sched/test_generation_batch_coalescing.py b/tests/core/sched/test_generation_batch_coalescing.py
+index 8aced77c6..7f108e6f7 100644
+--- a/tests/core/sched/test_generation_batch_coalescing.py
++++ b/tests/core/sched/test_generation_batch_coalescing.py
+@@ -10,6 +10,8 @@ from vllm.v1.core.sched.interface import PauseState
+ from vllm.v1.request import RequestStatus
+ 
+ from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
++from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
++from vllm_omni.core.sched.output import OmniChunkRecvHandle
+ from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
+ 
+ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+@@ -60,6 +62,20 @@ def notification(*ids, terminal=()):
+     return OmniConnectorOutput(chunk_ready_req_ids=set(ids), chunk_finished_req_ids=set(terminal))
+ 
+ 
++@pytest.mark.parametrize("live,ready,release", [(8, 3, False), (8, 4, True), (3, 1, True), (4, 1, False)])
++def test_batch_release_preserves_threshold_and_low_concurrency(monkeypatch, live, ready, release):
++    s, _ = scheduler(monkeypatch)
++    s.requests = dict(list(s.requests.items())[:live])
++    assert s._generation_batch_ready({str(i) for i in range(ready)}) is release
++
++
++def test_runnable_streams_exclude_stale_finished_and_in_flight_requests(monkeypatch):
++    s, _ = scheduler(monkeypatch)
++    s.requests["1"].is_finished = lambda: True
++    s.requests["2"].num_in_flight_tokens = 1
++    assert s._generation_runnable_ids({"0", "1", "2", "gone"}) == {"0"}
++
++
+ class Inbox:
+     def __init__(self, clock, initial=(), delayed=()):
+         self.clock = clock
+@@ -86,19 +102,25 @@ def scheduler(monkeypatch, initial=(), delayed=()):
+     clock = [10.0]
+     monkeypatch.setattr("vllm_omni.core.sched.omni_generation_scheduler.time.monotonic", lambda: clock[0])
+     s = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
++    s._native_data_plane = True
+     s._generation_max_wait_s = 0.012
+     s._generation_min_batch_size = 4
+     s._pause_state = PauseState.UNPAUSED
+     s.requests = {
+-        str(i): SimpleNamespace(request_id=str(i), num_in_flight_tokens=0, is_finished=lambda: False) for i in range(8)
++        str(i): SimpleNamespace(
++            request_id=str(i),
++            status=RequestStatus.WAITING_FOR_CHUNK,
++            num_in_flight_tokens=0,
++            is_finished=lambda: False,
++        )
++        for i in range(8)
+     }
+     s.running = list(s.requests.values())
+-    s.input_coordinator = SimpleNamespace(
+-        requests_with_ready_chunks=set(), finished_requests=set(), input_terminal_req_ids=set()
+-    )
++    s.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
++    s.chunk_transfer_adapter = None
+     s._latest_omni_connector_output = None
+     s._outputs_awaiting_stage_payload = {}
+-    s._omni_connector_output_inbox = Inbox(clock, initial, delayed)
++    monkeypatch.setattr(s, "_omni_connector_output_inbox", Inbox(clock, initial, delayed), raising=False)
+     return s, clock
+ 
+ 
+@@ -240,6 +262,47 @@ def test_retire_in_flight_output_before_waiting_without_resetting_deadline(monke
+     assert s._generation_batch_deadline is None
+ 
+ 
++@pytest.mark.parametrize("enabled", [False, True])
++def test_native_reduced_target_waits_only_when_enabled(monkeypatch, enabled):
++    s, clock = scheduler(monkeypatch, [notification("0")])
++    s.requests = {key: s.requests[key] for key in ("0", "1", "2")}
++    s._generation_always_wait_target_batch = enabled
++    assert s._drain_omni_connector_outputs() == [notification("0")]
++    assert clock[0] == pytest.approx(10.012 if enabled else 10)
++
++
++def test_native_reduced_target_releases_when_all_registered_streams_arrive(monkeypatch):
++    events = [notification("0"), notification("1", "2")]
++    s, clock = scheduler(monkeypatch, events[:1], [(0.003, events[1])])
++    s.requests = {key: s.requests[key] for key in ("0", "1", "2")}
++    s._generation_always_wait_target_batch = True
++    assert s._drain_omni_connector_outputs() == events
++    assert clock[0] == pytest.approx(10.003)
++
++
++def test_native_registered_population_keeps_non_runnable_requests_until_deadline(monkeypatch):
++    s, clock = scheduler(monkeypatch, [notification("0", terminal=["1"])])
++    s._generation_min_batch_size = 8
++    s._generation_always_wait_target_batch = True
++    s.input_coordinator.finished_requests.add("2")
++    s.input_coordinator.input_terminal_req_ids.add("3")
++    s.input_coordinator.pending_chunk_registrations = [OmniChunkRecvHandle(request_id="4", external_req_id="4")]
++    s.requests["5"].status = RequestStatus.WAITING_FOR_INPUT
++    s.requests["6"].is_finished = lambda: True
++    s.requests.pop("7")
++    assert s._drain_omni_connector_outputs() == [notification("0", terminal=["1"])]
++    assert clock[0] == pytest.approx(10.012)
++
++
++def test_ready_terminal_counts_toward_reduced_target(monkeypatch):
++    event = notification("0", "1", terminal=["1"])
++    s, clock = scheduler(monkeypatch, [event])
++    s.requests = {key: s.requests[key] for key in ("0", "1")}
++    s._generation_always_wait_target_batch = True
++    assert s._drain_omni_connector_outputs() == [event]
++    assert clock[0] == 10
++
++
+ def test_expired_deadline_dispatches_even_with_other_requests_in_flight(monkeypatch):
+     s, clock = scheduler(monkeypatch, [notification("0")])
+     s.requests["7"].num_in_flight_tokens = 1
+@@ -263,3 +326,11 @@ def test_deferred_schedule_keeps_pending_request_and_allocates_nothing(monkeypat
+     assert list(s.waiting) == [request]
+     assert request.num_computed_tokens == request.num_in_flight_tokens == 0
+     assert s.chunk_transfer_adapter.restore_called
++
++
++def test_native_lone_registered_stream_dispatches_without_waiting(monkeypatch):
++    s, clock = scheduler(monkeypatch, [notification("0")])
++    s.requests = {"0": s.requests["0"]}
++    s._generation_always_wait_target_batch = True
++    assert s._drain_omni_connector_outputs() == [notification("0")]
++    assert clock[0] == 10
+diff --git a/tests/core/sched/test_generation_scheduler_init.py b/tests/core/sched/test_generation_scheduler_init.py
+index 303a05068..f1b688f97 100644
+--- a/tests/core/sched/test_generation_scheduler_init.py
++++ b/tests/core/sched/test_generation_scheduler_init.py
+@@ -44,6 +44,49 @@ def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128
+     )
+ 
+ 
++def test_v1_custom_readiness_enables_batch_waiting(construct_scheduler):
++    class OrchestratorScheduler(OmniGenerationScheduler):
++        def _get_coalescing_ready_request_ids(self, connector_outputs=()):
++            return set()
++
++    config = _config(native=False, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 12})
++    config.model_config.async_chunk = False
++    scheduler = OrchestratorScheduler(config)
++    assert scheduler.chunk_transfer_adapter is None
++    assert scheduler._generation_min_batch_size == 4
++    assert scheduler._generation_max_wait_s == 0.012
++
++
++@pytest.mark.parametrize("native", [False, True])
++@pytest.mark.parametrize("connector_override", [False, True])
++def test_stage_additional_config_enables_generation_coalescing(construct_scheduler, native, connector_override):
++    extras = {"generation_min_batch_size": 8} if connector_override else {}
++    config = _config(native=native, extras=extras)
++    config.additional_config = {
++        "generation_min_batch_size": 4,
++        "generation_max_wait_ms": 12,
++        "generation_always_wait_target_batch": True,
++    }
++    scheduler = construct_scheduler(config)
++    assert scheduler._generation_min_batch_size == (8 if connector_override else 4)
++    assert scheduler._generation_max_wait_s == 0.012
++    assert scheduler._generation_always_wait_target_batch is True
++    assert config.additional_config["generation_min_batch_size"] == 4
++    assert config.model_config.stage_connector_config == {"extra": extras}
++
++
++@pytest.mark.parametrize("async_chunk", [False, True])
++def test_v1_stage_zero_enables_batch_waiting_without_override(construct_scheduler, mocker, async_chunk):
++    adapter = mocker.patch("vllm_omni.core.sched.omni_scheduler_mixin.OmniChunkTransferAdapter")
++    adapter.return_value.receives_chunks = False
++    config = _config(native=False, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 12})
++    config.model_config.stage_id = 0
++    config.model_config.async_chunk = async_chunk
++    scheduler = construct_scheduler(config)
++    assert scheduler._generation_min_batch_size == 4
++    assert scheduler._generation_max_wait_s == 0.012
++
++
+ @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
+ def test_moss_profile_generation_constructor_after_platform_resolution(
+     construct_scheduler, monkeypatch, mocker, platform
+@@ -67,17 +110,11 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
+     # The raw extras persist through fallback; the live constructor must cope.
+     assert extras["generation_min_batch_size"] == 16
+     assert extras["generation_max_wait_ms"] == 6
+-    if platform == "cuda":
+-        assert scheduler._native_data_plane and scheduler.input_coordinator is not None
+-        assert scheduler._generation_min_batch_size == 16
+-        assert scheduler._generation_max_wait_s == 0.006
+-        assert scheduler._generation_max_regular_batch == 0
+-        warning.assert_not_called()
+-    else:
+-        assert not scheduler._native_data_plane and scheduler.chunk_transfer_adapter is not None
+-        assert scheduler._generation_min_batch_size == 1
+-        assert scheduler._generation_max_wait_s == scheduler._generation_max_regular_batch == 0
+-        warning.assert_called_once()
++    assert scheduler._native_data_plane is (platform == "cuda")
++    assert scheduler._generation_min_batch_size == 16
++    assert scheduler._generation_max_wait_s == 0.006
++    assert scheduler._generation_max_regular_batch == 0
++    warning.assert_not_called()
+ 
+ 
+ @pytest.mark.parametrize("stateful,tp,pp", [(False, 1, 1), (True, 2, 1), (True, 1, 2)])
+@@ -85,7 +122,7 @@ def test_native_batch_waiting_still_rejects_unsupported_state_or_topology(constr
+     config = _config(
+         stateful=stateful, tp=tp, pp=pp, extras={"generation_min_batch_size": 32, "generation_max_wait_ms": 12}
+     )
+-    with pytest.raises(ValueError, match="stateful native MRV2 TP1/PP1"):
++    with pytest.raises(ValueError, match="stateful|TP1/PP1"):
+         construct_scheduler(config)
+ 
+ 
+@@ -103,3 +140,54 @@ def test_native_batch_waiting_still_rejects_unsupported_state_or_topology(constr
+ def test_non_native_fallback_still_rejects_invalid_values(construct_scheduler, extras, message):
+     with pytest.raises(ValueError, match=message):
+         construct_scheduler(_config(native=False, extras=extras))
++
++
++@pytest.mark.parametrize("stateful", [False, True])
++def test_v1_chunk_receiver_enables_batch_waiting(construct_scheduler, stateful):
++    config = _config(
++        native=False, stateful=stateful, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 10}
++    )
++    scheduler = construct_scheduler(config)
++    assert scheduler._generation_min_batch_size == 4
++    assert scheduler._generation_max_wait_s == 0.01
++
++
++def test_v1_rejects_idle_inbox_waiting(construct_scheduler):
++    config = _config(
++        native=False,
++        extras={
++            "generation_min_batch_size": 4,
++            "generation_max_wait_ms": 10,
++            "generation_coalescing_policy": "idle_wait",
++        },
++    )
++    with pytest.raises(ValueError, match="only the fixed"):
++        construct_scheduler(config)
++
++
++def test_sender_only_adapter_keeps_batch_waiting_disabled(construct_scheduler, mocker):
++    adapter = mocker.patch("vllm_omni.core.sched.omni_scheduler_mixin.OmniChunkTransferAdapter")
++    adapter.return_value.receives_chunks = False
++    config = _config(native=False, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 10})
++    scheduler = construct_scheduler(config)
++    assert scheduler._generation_min_batch_size == 1
++    assert scheduler._generation_max_wait_s == 0
++
++
++@pytest.mark.parametrize("tp,pp", [(2, 1), (1, 2)])
++def test_v1_batch_waiting_rejects_parallel_topologies(construct_scheduler, tp, pp):
++    config = _config(native=False, tp=tp, pp=pp, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 10})
++    with pytest.raises(ValueError, match="TP1/PP1"):
++        construct_scheduler(config)
++
++
++@pytest.mark.parametrize("value", ["true", 1, None])
++def test_batch_target_option_requires_a_boolean(construct_scheduler, value):
++    with pytest.raises(ValueError, match="generation_always_wait_target_batch must be a boolean"):
++        construct_scheduler(_config(native=False, extras={"generation_always_wait_target_batch": value}))
++
++
++@pytest.mark.parametrize("native", [False, True])
++def test_batch_target_option_reaches_each_runner(construct_scheduler, native):
++    scheduler = construct_scheduler(_config(native=native, extras={"generation_always_wait_target_batch": True}))
++    assert scheduler._generation_always_wait_target_batch is True
+diff --git a/tests/core/sched/test_generation_v1_coalescing.py b/tests/core/sched/test_generation_v1_coalescing.py
+new file mode 100644
+index 000000000..22a159c48
+--- /dev/null
++++ b/tests/core/sched/test_generation_v1_coalescing.py
+@@ -0,0 +1,253 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
++
++"""V1 coalescing preserves scheduler state until a batch can execute."""
++
++from types import SimpleNamespace
++
++import pytest
++from vllm.v1.core.sched.interface import PauseState
++from vllm.v1.core.sched.output import SchedulerOutput
++from vllm.v1.request import RequestStatus
++
++from tests.core.sched.test_generation_scheduler_atomic_chunk import (
++    _make_request,
++    _make_scheduler,
++    _stage_running_chunk,
++    _stage_waiting_chunk,
++)
++from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler, VLLMScheduler
++
++pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
++
++
++def scheduler(monkeypatch, queue_name="waiting"):
++    clock = [10.0]
++    monkeypatch.setattr("vllm_omni.core.sched.omni_generation_scheduler.time.monotonic", lambda: clock[0])
++    s = _make_scheduler(budget=32)
++    s._generation_min_batch_size = 4
++    s._generation_max_wait_s = 0.012
++    s._generation_pending_inputs = set()
++    for i in range(4):
++        s.requests[str(i)] = _make_request(str(i), 8)
++    stage = _stage_running_chunk if queue_name == "running" else _stage_waiting_chunk
++    stage(s, s.requests["0"])
++    return s, clock
++
++
++@pytest.mark.parametrize("queue_name", ["running", "waiting", "kv_holding_waiting"])
++def test_v1_wait_does_not_allocate_or_consume_input(monkeypatch, mocker, queue_name):
++    s, clock = scheduler(monkeypatch, queue_name)
++    if queue_name == "kv_holding_waiting":
++        s.waiting.remove_requests([s.requests["0"]])
++        s.kv_holding_waiting.add_request(s.requests["0"])
++    allocate = mocker.spy(s.kv_cache_manager, "allocate_slots")
++    request = s.requests["0"]
++    payload = request.additional_information = {"codes": {"audio": [1, 2]}}
++    before_status = request.status
++    output = s.schedule()
++    assert output.num_scheduled_tokens == {}
++    allocate.assert_not_called()
++    assert s.chunk_transfer_adapter.requests_with_ready_chunks == {"0"}
++    assert request.additional_information is payload
++    assert request.num_computed_tokens == request.num_in_flight_tokens == 0
++    assert request.status == before_status
++    assert list(getattr(s, queue_name)) == [request]
++    clock[0] += 0.006
++    assert s.schedule().num_scheduled_tokens == {}
++    assert s._generation_batch_deadline == pytest.approx(10.012)
++    clock[0] += 0.006
++    assert s.schedule().num_scheduled_tokens == {"0": 8}
++    assert s._generation_batch_deadline is None
++
++
++def test_v1_releases_when_more_chunks_arrive(monkeypatch):
++    s, clock = scheduler(monkeypatch)
++    assert not s.schedule().num_scheduled_tokens
++    clock[0] += 0.003
++    for i in range(1, 4):
++        _stage_waiting_chunk(s, s.requests[str(i)])
++    assert s.schedule().num_scheduled_tokens == {str(i): 8 for i in range(4)}
++    assert s._generation_batch_deadline is None
++
++
++def test_v1_wait_uses_overridden_readiness_without_receiver(monkeypatch):
++    s, clock = scheduler(monkeypatch)
++    s.chunk_transfer_adapter.receives_chunks = False
++    ready = {"0"}
++    monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: ready)
++    s._process_v1_pending_omni_inputs()
++    assert s._generation_defer_batch
++    assert s._generation_batch_deadline == pytest.approx(10.012)
++    clock[0] += 0.003
++    ready.update({"1", "2", "3"})
++    s._process_v1_pending_omni_inputs()
++    assert not s._generation_defer_batch
++    assert s._generation_batch_deadline is None
++
++
++@pytest.mark.parametrize("release", ["timeout", "target"])
++@pytest.mark.parametrize("source", ["override", "stage_zero"])
++def test_input_readiness_defers_upstream_fallback_without_connector(monkeypatch, mocker, release, source):
++    s, clock = scheduler(monkeypatch)
++    s.chunk_transfer_adapter = None
++    ready = {"0"}
++    if source == "override":
++        monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: ready.copy())
++    else:
++        s.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
++    allocate = mocker.spy(s.kv_cache_manager, "allocate_slots")
++    budgets = []
++
++    def upstream(self, throttle_prefills=False):
++        # The real upstream scheduler uses this budget for allocation; pin the
++        # boundary so a readiness decision alone cannot falsely pass the test.
++        budgets.append(self.max_num_scheduled_tokens)
++        assert self.max_num_scheduled_tokens == 0
++        output = SchedulerOutput.make_empty()
++        output.finished_req_ids = {"finished"}
++        return output
++
++    monkeypatch.setattr(VLLMScheduler, "schedule", upstream)
++    payload = s.requests["0"].additional_information = {"audio": [1, 2]}
++    assert s.schedule().finished_req_ids == {"finished"}
++    clock[0] += 0.006
++    assert not s.schedule().num_scheduled_tokens
++    assert budgets == [0, 0]
++    allocate.assert_not_called()
++    assert s.max_num_scheduled_tokens == 32
++    assert s.requests["0"].additional_information is payload
++    assert s.requests["0"].num_computed_tokens == s.requests["0"].num_in_flight_tokens == 0
++    assert list(s.waiting) == [s.requests["0"]]
++    if release == "timeout":
++        clock[0] += 0.006
++        expected = {"0": 8}
++    else:
++        for i in range(1, 4):
++            s.waiting.add_request(s.requests[str(i)])
++            ready.add(str(i))
++        expected = {str(i): 8 for i in range(4)}
++    assert s.schedule().num_scheduled_tokens == expected
++    assert s._generation_batch_deadline is None
++    assert s.max_num_scheduled_tokens == 32
++    if source == "stage_zero":
++        assert s._get_coalescing_ready_request_ids() == set()
++
++
++def test_custom_readiness_fallback_restores_budget_and_queues_on_failure(monkeypatch, mocker):
++    s, _ = scheduler(monkeypatch)
++    s.chunk_transfer_adapter = None
++    monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: {"0"})
++    restore = mocker.spy(s, "_restore_omni_wait_queues")
++
++    def upstream(self, throttle_prefills=False):
++        assert self.max_num_scheduled_tokens == 0
++        raise RuntimeError("upstream failed")
++
++    monkeypatch.setattr(VLLMScheduler, "schedule", upstream)
++    with pytest.raises(RuntimeError, match="upstream failed"):
++        s.schedule()
++    assert s.max_num_scheduled_tokens == 32
++    restore.assert_called_once()
++    assert list(s.waiting) == [s.requests["0"]]
++
++
++def test_v1_cancelled_request_is_not_restored(monkeypatch):
++    s, clock = scheduler(monkeypatch)
++    assert not s.schedule().num_scheduled_tokens
++    s.finish_requests({"0"}, RequestStatus.FINISHED_ABORTED)
++    clock[0] += 0.012
++    assert not s.schedule().num_scheduled_tokens
++    assert "0" not in s.requests
++    assert not s.running and not s.waiting
++    assert s._generation_batch_deadline is None
++
++
++@pytest.mark.parametrize("reason", ["disabled", "low_concurrency", "pending", "terminal"])
++def test_v1_immediate_progress(monkeypatch, reason):
++    s, _ = scheduler(monkeypatch)
++    if reason == "disabled":
++        s._generation_max_wait_s = 0
++    elif reason == "low_concurrency":
++        s.requests.pop("3")
++    elif reason == "pending":
++        s._generation_pending_inputs.add("0")
++    else:
++        # A terminal input participates in the same bounded window.
++        s.chunk_transfer_adapter.is_done_receiving_chunks = lambda request_id: request_id == "0"
++        assert not s.schedule().num_scheduled_tokens
++        s._generation_min_batch_size = 1
++    assert s.schedule().num_scheduled_tokens == {"0": 8}
++
++
++def test_v1_retains_in_flight_readiness_until_output_retires(monkeypatch):
++    s, clock = scheduler(monkeypatch)
++    s._supports_pending_generation = True
++    s.requests["0"].num_in_flight_tokens = 8
++    assert not s.schedule().num_scheduled_tokens
++    assert s.chunk_transfer_adapter.requests_with_ready_chunks == {"0"}
++    s.requests["0"].num_in_flight_tokens = 0
++    assert not s.schedule().num_scheduled_tokens
++    clock[0] += 0.012
++    assert s.schedule().num_scheduled_tokens == {"0": 8}
++
++
++def test_v1_pause_does_not_keep_a_stale_deadline(monkeypatch):
++    s, clock = scheduler(monkeypatch)
++    assert not s.schedule().num_scheduled_tokens
++    s._pause_state = PauseState.PAUSED_ALL
++    assert not s.schedule().num_scheduled_tokens
++    assert s._generation_batch_deadline is None
++    clock[0] += 1
++    s._pause_state = PauseState.UNPAUSED
++    assert not s.schedule().num_scheduled_tokens
++    assert s._generation_batch_deadline == pytest.approx(11.012)
++
++
++def test_free_request_clears_pending_input_ownership(monkeypatch):
++    s, _ = scheduler(monkeypatch)
++    s._generation_pending_inputs.add("0")
++    monkeypatch.setattr(VLLMScheduler, "_free_request", lambda *args: (None, None))
++    OmniGenerationScheduler._free_request(s, s.requests["0"])
++    assert not s._generation_pending_inputs
++
++
++@pytest.mark.parametrize("enabled", [False, True])
++def test_v1_reduced_target_waits_only_when_enabled(monkeypatch, enabled):
++    s, clock = scheduler(monkeypatch)
++    s.requests.pop("3")
++    s._generation_always_wait_target_batch = enabled
++    output = s.schedule()
++    assert bool(output.num_scheduled_tokens) is not enabled
++    if enabled:
++        clock[0] += 0.012
++        assert s.schedule().num_scheduled_tokens == {"0": 8}
++
++
++def test_v1_reduced_target_releases_when_all_registered_streams_arrive(monkeypatch):
++    s, clock = scheduler(monkeypatch)
++    s.requests.pop("3")
++    s._generation_always_wait_target_batch = True
++    assert not s.schedule().num_scheduled_tokens
++    clock[0] += 0.003
++    for i in (1, 2):
++        _stage_waiting_chunk(s, s.requests[str(i)])
++    assert s.schedule().num_scheduled_tokens == {str(i): 8 for i in range(3)}
++
++
++def test_v1_shrinking_registered_population_releases_lone_stream(monkeypatch):
++    s, _ = scheduler(monkeypatch)
++    s._generation_always_wait_target_batch = True
++    assert not s.schedule().num_scheduled_tokens
++    s.finish_requests({"1", "2", "3"}, RequestStatus.FINISHED_ABORTED)
++    assert s.schedule().num_scheduled_tokens == {"0": 8}
++
++
++def test_v1_inactive_registered_streams_keep_target_until_deadline(monkeypatch):
++    s, clock = scheduler(monkeypatch)
++    s._generation_always_wait_target_batch = True
++    s.chunk_transfer_adapter._active_window = 1
++    s.chunk_transfer_adapter._active_streams = {"0"}
++    assert not s.schedule().num_scheduled_tokens
++    clock[0] += 0.012
++    assert s.schedule().num_scheduled_tokens == {"0": 8}
+diff --git a/tests/core/sched/test_omni_ar_scheduler_prefill_admission.py b/tests/core/sched/test_omni_ar_scheduler_prefill_admission.py
+index 939416f8b..48b737457 100644
+--- a/tests/core/sched/test_omni_ar_scheduler_prefill_admission.py
++++ b/tests/core/sched/test_omni_ar_scheduler_prefill_admission.py
+@@ -6,7 +6,9 @@ import time
+ from types import SimpleNamespace
+ 
+ import pytest
++from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+ 
++from tests.core.sched.test_generation_scheduler_atomic_chunk import _make_request
+ from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+ 
+ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+@@ -15,13 +17,18 @@ defer = OmniARScheduler._should_defer_waiting_admission
+ 
+ 
+ def _scheduler(min_batch=4, max_wait_s=5.0, min_running=0, running=2, waiting=1, waited_s=0.0):
+-    return SimpleNamespace(
+-        _prefill_admission_min_batch=min_batch,
+-        _prefill_admission_max_wait_s=max_wait_s,
+-        _prefill_admission_min_running=min_running,
+-        running=list(range(running)),
+-        waiting=[SimpleNamespace(arrival_time=time.time() - waited_s) for _ in range(waiting)],
+-    )
++    scheduler = OmniARScheduler.__new__(OmniARScheduler)
++    scheduler.max_num_running_reqs = 128
++    scheduler._prefill_admission_min_batch = min_batch
++    scheduler._prefill_admission_max_wait_s = max_wait_s
++    scheduler._prefill_admission_min_running = min_running
++    scheduler.running = [_make_request(f"running-{i}", 8) for i in range(running)]
++    scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
++    for i in range(waiting):
++        request = _make_request(f"waiting-{i}", 8)
++        request.arrival_time = time.time() - waited_s
++        scheduler.waiting.add_request(request)
++    return scheduler
+ 
+ 
+ def test_waits_until_a_batch_queues_or_the_oldest_waited_long_enough():
+@@ -47,9 +54,10 @@ def test_a_batch_size_needs_a_wait_bound():
+             stage_connector_config={"extra": {"ar_prefill_admission_min_batch": 6}},
+         )
+     )
+-    scheduler = SimpleNamespace(vllm_config=config)
++    scheduler = _scheduler()
++    scheduler.vllm_config = config
+     with pytest.raises(ValueError, match="max_wait_ms"):
+-        OmniARScheduler._init_prefill_admission_policy(scheduler)
++        scheduler._init_prefill_admission_policy(scheduler._get_scheduler_extra_config())
+ 
+ 
+ def test_a_stage_without_connector_knobs_reads_additional_config():
+@@ -62,14 +70,15 @@ def test_a_stage_without_connector_knobs_reads_additional_config():
+         model_config=SimpleNamespace(stage_connector_config={"extra": {"stage_id": 0}}),
+         additional_config=knobs,
+     )
+-    scheduler = SimpleNamespace(vllm_config=config)
+-    OmniARScheduler._init_prefill_admission_policy(scheduler)
++    scheduler = _scheduler()
++    scheduler.vllm_config = config
++    scheduler._init_prefill_admission_policy(scheduler._get_scheduler_extra_config())
+     assert scheduler._prefill_admission_min_batch == 8
+     assert scheduler._prefill_admission_max_wait_s == pytest.approx(0.1)
+     assert scheduler._prefill_admission_min_running == 4
+ 
+     config.model_config.stage_connector_config["extra"]["ar_prefill_admission_min_batch"] = 6
+-    OmniARScheduler._init_prefill_admission_policy(scheduler)
++    scheduler._init_prefill_admission_policy(scheduler._get_scheduler_extra_config())
+     assert scheduler._prefill_admission_min_batch == 6
+ 
+ 
+@@ -88,8 +97,8 @@ def test_single_stage_admission_settings_and_connector_precedence(connector_batc
+             )
+         ),
+     )
+-    OmniARScheduler._init_prefill_admission_policy(scheduler)
++    scheduler._init_prefill_admission_policy(scheduler._get_scheduler_extra_config())
+     assert defer(scheduler) is (connector_batch is None)
+     # The wait bound applies even if the single-stage batch has not filled.
+-    scheduler.waiting[0].arrival_time = time.time() - 1.0
++    next(iter(scheduler.waiting)).arrival_time = time.time() - 1.0
+     assert not defer(scheduler)
+diff --git a/tests/core/sched/test_omni_coalescing_readiness.py b/tests/core/sched/test_omni_coalescing_readiness.py
+new file mode 100644
+index 000000000..a59ab53b6
+--- /dev/null
++++ b/tests/core/sched/test_omni_coalescing_readiness.py
+@@ -0,0 +1,155 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
++"""Input readiness is shared without consuming connector state."""
++
++from types import SimpleNamespace
++
++import pytest
++from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
++from vllm.v1.request import RequestStatus
++
++from tests.core.sched.test_generation_scheduler_atomic_chunk import FakeAdapter, _make_request
++from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
++from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
++from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
++from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
++
++pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
++
++
++@pytest.fixture(params=[OmniARScheduler, OmniGenerationScheduler])
++def scheduler(request):
++    s = request.param.__new__(request.param)
++    s.chunk_transfer_adapter = None
++    s.input_coordinator = None
++    s._native_data_plane = False
++    s.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=1))
++    return s
++
++
++def test_legacy_readiness_is_a_snapshot(scheduler):
++    adapter = scheduler.chunk_transfer_adapter = FakeAdapter()
++    assert scheduler._get_coalescing_ready_request_ids() == set()
++    adapter.requests_with_ready_chunks.add("ready")
++    ready = scheduler._get_coalescing_ready_request_ids()
++    assert ready == {"ready"}
++    ready.clear()
++    assert adapter.requests_with_ready_chunks == {"ready"}
++
++
++@pytest.mark.parametrize("connector_form", ["absent", "flat", "nested", "object"])
++def test_shared_config_resolution_preserves_connector_precedence(scheduler, connector_form):
++    additional = {"generation_min_batch_size": 4, "generation_max_wait_ms": 12}
++    scheduler.vllm_config.additional_config = additional
++    extra = {"generation_min_batch_size": 8}
++    scheduler.vllm_config.model_config.stage_connector_config = {
++        "absent": None,
++        "flat": extra,
++        "nested": {"extra": extra},
++        "object": SimpleNamespace(extra=extra),
++    }[connector_form]
++    assert scheduler._get_scheduler_extra_config() == {
++        "generation_min_batch_size": 4 if connector_form == "absent" else 8,
++        "generation_max_wait_ms": 12,
++    }
++    assert additional == {"generation_min_batch_size": 4, "generation_max_wait_ms": 12}
++    assert extra == {"generation_min_batch_size": 8}
++
++
++@pytest.mark.parametrize("source", ["none", "sender", "stage_zero", "full_payload"])
++def test_unsupported_sources_are_distinct_from_empty(scheduler, source):
++    if source == "sender":
++        scheduler.chunk_transfer_adapter = FakeAdapter(receives_chunks=False)
++    elif source in ("stage_zero", "full_payload"):
++        scheduler._native_data_plane = True
++        scheduler.input_coordinator = OmniSchedulingCoordinator(
++            stage_id=0 if source == "stage_zero" else 1,
++            async_chunk=source != "full_payload",
++        )
++    assert scheduler._get_coalescing_ready_request_ids() is None
++
++
++def test_native_readiness_includes_unapplied_terminal_notifications(scheduler):
++    scheduler._native_data_plane = True
++    coordinator = scheduler.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
++    assert scheduler._get_coalescing_ready_request_ids() == set()
++    coordinator.requests_with_ready_chunks.add("ready")
++    coordinator.finished_requests.add("finished")
++    coordinator.input_terminal_req_ids.add("terminal")
++    output = OmniConnectorOutput(
++        chunk_ready_req_ids={"new", "ready"},
++        chunk_finished_req_ids={"new_finished"},
++        request_metadata={
++            "new_terminal": SchedulingMetadataUpdate(input_terminal=True),
++            "other": SchedulingMetadataUpdate(input_terminal=False),
++        },
++    )
++    assert scheduler._get_coalescing_ready_request_ids(iter([output])) == {
++        "ready",
++        "finished",
++        "terminal",
++        "new",
++        "new_finished",
++        "new_terminal",
++    }
++    assert coordinator.requests_with_ready_chunks == {"ready"}
++    assert coordinator.finished_requests == {"finished"}
++    assert coordinator.input_terminal_req_ids == {"terminal"}
++    assert output.chunk_ready_req_ids == {"new", "ready"}
++    assert output.chunk_finished_req_ids == {"new_finished"}
++
++
++@pytest.mark.parametrize("transport", ["none", "legacy_sender", "native_sender"])
++def test_stage_zero_readiness_follows_queued_input(scheduler, transport):
++    scheduler.vllm_config.model_config.stage_id = 0
++    scheduler._native_data_plane = transport == "native_sender"
++    if transport == "native_sender":
++        scheduler.input_coordinator = OmniSchedulingCoordinator(stage_id=0, async_chunk=True)
++    elif transport == "legacy_sender":
++        scheduler.chunk_transfer_adapter = FakeAdapter(receives_chunks=False)
++    # Policy initialization must work before request queues exist.
++    assert scheduler._get_coalescing_ready_request_ids() == set()
++    scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
++    scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
++    initial = _make_request("initial", 8)
++    resumed = _make_request("resumed", 8)
++    resumed.status = RequestStatus.WAITING_FOR_STREAMING_REQ
++    scheduler.waiting.add_request(initial)
++    scheduler.kv_holding_waiting.add_request(resumed)
++    assert scheduler._get_coalescing_ready_request_ids() == {"initial"}
++    # An applied streaming append resumes ordinary admission.
++    resumed.status = RequestStatus.WAITING
++    assert scheduler._get_coalescing_ready_request_ids() == {"initial", "resumed"}
++    initial.status = RequestStatus.PREEMPTED
++    assert scheduler._get_coalescing_ready_request_ids() == {"initial", "resumed"}
++    initial.status = RequestStatus.RUNNING
++    resumed.status = RequestStatus.WAITING_FOR_STREAMING_REQ
++    assert scheduler._get_coalescing_ready_request_ids() == set()
++    assert list(scheduler.waiting) == [initial]
++    assert list(scheduler.kv_holding_waiting) == [resumed]
++
++
++@pytest.mark.parametrize(
++    "status",
++    [RequestStatus.WAITING_FOR_CHUNK, RequestStatus.WAITING_FOR_INPUT, RequestStatus.FINISHED_ABORTED],
++)
++def test_stage_zero_excludes_blocked_or_finished_queued_requests(scheduler, status):
++    scheduler.vllm_config.model_config.stage_id = 0
++    request = _make_request("blocked", 8)
++    request.status = status
++    scheduler.waiting = [request]
++    assert scheduler._get_coalescing_ready_request_ids() == set()
++
++
++@pytest.mark.parametrize("native", [False, True])
++def test_connector_readiness_takes_precedence_over_stage_zero_queues(scheduler, native):
++    scheduler.vllm_config.model_config.stage_id = 0
++    scheduler.waiting = [_make_request("queued", 8)]
++    if native:
++        scheduler._native_data_plane = True
++        owner = scheduler.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
++    else:
++        owner = scheduler.chunk_transfer_adapter = FakeAdapter()
++    assert scheduler._get_coalescing_ready_request_ids() == set()
++    owner.requests_with_ready_chunks.add("connector")
++    assert scheduler._get_coalescing_ready_request_ids() == {"connector"}
+diff --git a/tests/worker/test_v1_coalescing_batch.py b/tests/worker/test_v1_coalescing_batch.py
+new file mode 100644
+index 000000000..d96de5111
+--- /dev/null
++++ b/tests/worker/test_v1_coalescing_batch.py
+@@ -0,0 +1,113 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
++"""V1 coalescing retains batch rows while still processing idle-step cleanup."""
++
++import numpy as np
++import pytest
++from vllm.v1.core.sched.output import CachedRequestData
++from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
++
++from vllm_omni.core.sched.output import OmniSchedulerOutput
++from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
++
++pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
++
++
++def runner(mocker):
++    r = OmniGPUModelRunner.__new__(OmniGPUModelRunner)
++    r.requests = {
++        req_id: CachedRequestState(
++            req_id=req_id,
++            prompt_token_ids=[1] * 128,
++            mm_features=[],
++            sampling_params=None,
++            generator=None,
++            block_ids=([0],),
++            num_computed_tokens=128,
++            output_token_ids=[2],
++        )
++        for req_id in ("live", "done")
++    }
++    batch = r.input_batch = mocker.Mock(spec=InputBatch)
++    batch.req_id_to_index = {"done": 0, "live": 1}
++    batch.prev_req_id_to_index = batch.req_id_to_index.copy()
++    batch.num_computed_tokens_cpu = np.array([128, 128])
++    batch.remove_request.side_effect = lambda req_id: batch.req_id_to_index.pop(req_id, None)
++
++    def condense():
++        # Mirror row compaction while retaining the previous GPU batch's map.
++        batch.req_id_to_index = {req_id: i for i, req_id in enumerate(batch.req_id_to_index)}
++
++    batch.condense.side_effect = condense
++    r.model_intermediate_buffer = {"done": {}}
++    r.num_prompt_logprobs = {"done": 1}
++    r.encoder_cache = {"old-mm": object()}
++    r.late_interaction_runner = mocker.Mock()
++    r._omni_connector_initialized = True
++    r.cleanup_finished_request = mocker.Mock()
++    mocker.patch.object(r, "_drop_hs_pending_state")
++    mocker.patch.object(r, "_may_reorder_batch")
++    r.speculative_config = None
++    r.use_async_spec_decode = True
++    r.use_async_scheduling = True
++    r.prev_num_draft_tokens = mocker.Mock(np=np.array([0, 2]))
++    mocker.patch("vllm_omni.worker.gpu_model_runner.get_pp_group").return_value.is_last_rank = True
++    return r
++
++
++@pytest.mark.parametrize("preserve", [False, True])
++def test_idle_step_retains_only_coalesced_rows_and_cleans_finished_requests(mocker, preserve):
++    r = runner(mocker)
++    output = OmniSchedulerOutput.make_empty()
++    output.preserve_v1_batch = preserve
++    output.finished_req_ids = {"done"}
++    output.free_encoder_mm_hashes = ["old-mm"]
++    assert r._update_states(output) is None
++    assert r.input_batch.req_id_to_index == ({"live": 0} if preserve else {})
++    assert "done" not in r.requests
++    assert "done" not in r.model_intermediate_buffer
++    assert "done" not in r.num_prompt_logprobs
++    assert not r.encoder_cache
++    r.cleanup_finished_request.assert_called_once_with("done")
++    r.input_batch.add_request.assert_not_called()
++    r.input_batch.refresh_metadata.assert_called_once()
++    if preserve:
++        assert r.prev_num_draft_tokens.np.tolist() == [0, 2]
++        r._may_reorder_batch.assert_not_called()
++    else:
++        assert r.prev_num_draft_tokens.np.tolist() == [0, 0]
++
++
++@pytest.mark.parametrize("marker_on_execution", [False, True])
++def test_retained_row_resumes_async_spec_corrections_without_history_payload(mocker, marker_on_execution):
++    r = runner(mocker)
++    r.requests["live"].prev_num_draft_len = 2
++    idle = OmniSchedulerOutput.make_empty()
++    idle.preserve_v1_batch = True
++    idle.finished_req_ids = {"done"}
++    r._update_states(idle)
++    another_idle = OmniSchedulerOutput.make_empty()
++    another_idle.preserve_v1_batch = True
++    r._update_states(another_idle)
++    output = OmniSchedulerOutput.make_empty()
++    output.preserve_v1_batch = marker_on_execution
++    output.num_scheduled_tokens = {"live": 1}
++    output.total_num_scheduled_tokens = 1
++    output.scheduled_cached_reqs = CachedRequestData(
++        req_ids=["live"],
++        resumed_req_ids=set(),
++        new_token_ids=[],
++        all_token_ids={},
++        new_block_ids=[None],
++        num_computed_tokens=[130],
++        num_output_tokens=[3],
++    )
++    correction = r._update_states(output)
++    r.input_batch.add_request.assert_not_called()
++    assert r.requests["live"].num_computed_tokens == 130
++    mocker.patch.object(r, "_get_valid_sampled_token_count", return_value=[1, 2])
++    assert correction is not None
++    correction()
++    assert r.requests["live"].num_computed_tokens == 129
++    assert r.input_batch.num_computed_tokens_cpu[0] == 129
++    r._may_reorder_batch.assert_called_once_with(output)
+diff --git a/vllm_omni/core/sched/omni_ar_scheduler.py b/vllm_omni/core/sched/omni_ar_scheduler.py
+index e5d78fe40..4cf6929c7 100644
+--- a/vllm_omni/core/sched/omni_ar_scheduler.py
++++ b/vllm_omni/core/sched/omni_ar_scheduler.py
+@@ -6,7 +6,7 @@ from __future__ import annotations
+ import inspect
+ import time
+ from collections import defaultdict
+-from collections.abc import Iterable, Iterator
++from collections.abc import Iterable, Iterator, Mapping
+ from dataclasses import replace
+ from typing import Any, TypedDict
+ 
+@@ -14,8 +14,9 @@ import numpy as np
+ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.logger import init_logger
+ from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
++from vllm.v1.core.sched.interface import PauseState
+ from vllm.v1.core.sched.output import SchedulerOutput
+-from vllm.v1.core.sched.request_queue import create_request_queue
++from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
+ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
+ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
+ from vllm.v1.metrics.perf import PerfStats
+@@ -129,7 +130,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+     core scheduling logic.
+     """
+ 
++    waiting: RequestQueue
++    kv_holding_waiting: RequestQueue
+     max_num_active_reqs: int
++    max_num_scheduled_tokens: int
++    prev_step_scheduled_req_ids: set[str]
+ 
+     def _update_request_with_output(
+         self, request: Request, new_token_ids: list[int], is_stale: bool = False
+@@ -215,7 +220,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+         self._hold_payloadless_outputs = _holds_payloadless_outputs(self.vllm_config.model_config)
+         # External finishes release Request before their terminal output is assembled.
+         self._held_token_ids: dict[str, list[int]] = {}
+-        self._init_prefill_admission_policy()
++        extra = self._get_scheduler_extra_config()
++        self._init_prefill_admission_policy(extra)
++        self._init_generation_coalescing(extra)
+ 
+     def add_request(self, request: Request) -> None:
+         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
+@@ -369,7 +376,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+         is_final, _ = self._omni_final_stage_flags(request)
+         return is_final
+ 
+-    def _init_prefill_admission_policy(self) -> None:
++    def _init_prefill_admission_policy(self, extra: Mapping[str, Any]) -> None:
+         """Optional prefill batching under load (stage connector ``extra`` or ``additional_config``).
+ 
+         While at least ``ar_prefill_admission_min_running`` requests run, a new
+@@ -378,15 +385,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+         share one prefill / mixed step instead of each turning a decode step
+         into one. Off unless ``ar_prefill_admission_min_batch`` > 1.
+         """
+-        connector_config = getattr(self.vllm_config.model_config, "stage_connector_config", None)
+-        extra = (
+-            connector_config.get("extra", connector_config)
+-            if isinstance(connector_config, dict)
+-            else getattr(connector_config, "extra", None)
+-        ) or {}
+-        # A stage without a configured connector edge sets the same keys in additional_config.
+-        additional = getattr(self.vllm_config, "additional_config", None)
+-        extra = {**(additional if isinstance(additional, dict) else {}), **extra}
+         self._prefill_admission_min_batch = int(extra.get("ar_prefill_admission_min_batch", 0) or 0)
+         self._prefill_admission_max_wait_s = float(extra.get("ar_prefill_admission_max_wait_ms", 0) or 0) / 1000
+         self._prefill_admission_min_running = int(extra.get("ar_prefill_admission_min_running", 0) or 0)
+@@ -402,6 +400,70 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+                 self._prefill_admission_min_running,
+             )
+ 
++    def _init_generation_coalescing(self, extra: Mapping[str, Any]) -> None:
++        """Initialize AR execution batching after admission policy setup."""
++        super()._init_generation_coalescing(extra)
++        if self._generation_min_batch_size > 1 and self._generation_max_wait_s:
++            if any(
++                extra.get(key)
++                for key in (
++                    "ar_prefill_admission_min_batch",
++                    "ar_prefill_admission_max_wait_ms",
++                    "ar_prefill_admission_min_running",
++                )
++            ):
++                raise ValueError("generation coalescing and ar_prefill_admission_* cannot be enabled together")
++            parallel = self.vllm_config.parallel_config
++            if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
++                raise ValueError("AR generation batch waiting requires TP1/PP1")
++            if extra.get("generation_coalescing_policy", "fixed") != "fixed":
++                raise ValueError("AR generation batch waiting supports only the fixed coalescing policy")
++            if self._get_coalescing_ready_request_ids() is None:
++                logger.warning("AR generation batch waiting ignored: requires input readiness support")
++                self._generation_max_wait_s = 0.0
++
++    def _get_ar_coalescing_ready_request_ids(self) -> set[str]:
++        """Count candidates, leaving allocation and execution limits upstream."""
++        ready = self._get_coalescing_ready_request_ids()
++        if ready is None:
++            return set()
++        ready.update(
++            request.request_id
++            for request in self.running
++            if request.status == RequestStatus.RUNNING
++            and request.num_tokens_with_spec + request.num_output_placeholders > request.num_computed_tokens
++        )
++        for queue in (self.waiting, self.kv_holding_waiting):
++            ready.update(
++                request.request_id
++                for request in queue
++                if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
++            )
++        return {
++            req_id
++            for req_id in ready
++            if (request := self.requests.get(req_id)) is not None
++            and request.status in (RequestStatus.RUNNING, RequestStatus.WAITING, RequestStatus.PREEMPTED)
++        }
++
++    def _should_defer_ar_generation(self, ready_ids: set[str]) -> bool:
++        """Bound batch waiting without restarting the deadline as inputs arrive."""
++        max_wait = getattr(self, "_generation_max_wait_s", 0.0)
++        target = getattr(self, "_generation_min_batch_size", 1)
++        if not max_wait or target <= 1 or self._pause_state != PauseState.UNPAUSED:
++            self._generation_batch_deadline = None
++            return False
++        if not ready_ids or self._generation_batch_ready(ready_ids):
++            self._generation_batch_deadline = None
++            return False
++        now = time.monotonic()
++        if self._generation_batch_deadline is None:
++            self._generation_batch_deadline = now + max_wait
++        if now >= self._generation_batch_deadline:
++            self._generation_batch_deadline = None
++            return False
++        return True
++
+     def _should_defer_waiting_admission(self) -> bool:
+         min_batch = getattr(self, "_prefill_admission_min_batch", 0)
+         if (
+@@ -785,12 +847,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+         self._process_pending_omni_inputs(model_mode="ar")
+         self._drop_aborted_queued_requests()
+         self._resync_streaming_input_counter()
++        defer_generation = False
++        if getattr(self, "_generation_max_wait_s", 0.0) and self._generation_min_batch_size > 1:
++            defer_generation = self._should_defer_ar_generation(self._get_ar_coalescing_ready_request_ids())
+         # Talker K-frame guard: a step whose decode spans would be uneven
+         # (mixed prefill+decode rows, or a first-step decode joining a
+         # steady-state K-step request) must not carry the K-step drafts --
+         # the multi-frame loop requires uniform decode spans and the runner
+         # refuses the rest.
+-        self._drop_talker_drafts_if_prefill_pending()
++        if not defer_generation:
++            self._drop_talker_drafts_if_prefill_pending()
+ 
+         original_wait_queues = None
+         if self._should_defer_waiting_admission():
+@@ -805,9 +871,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+         )
+         if reserved_running_slots:
+             self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
++        original_token_budget = None
++        previous_batch_ids = None
++        if defer_generation:
++            # Both runners still process control/completion work on empty
++            # steps. Defer before allocation, never discard a scheduled batch.
++            original_token_budget = self.max_num_scheduled_tokens
++            self.max_num_scheduled_tokens = 0
++            if not self.use_v2_model_runner:
++                previous_batch_ids = self.prev_step_scheduled_req_ids.copy()
+         try:
+             scheduler_output = super().schedule(throttle_prefills)
+         finally:
++            if original_token_budget is not None:
++                self.max_num_scheduled_tokens = original_token_budget
++            if previous_batch_ids is not None:
++                # Upstream clears these on empty steps, causing the next V1
++                # execution to copy full histories for otherwise retained rows.
++                self.prev_step_scheduled_req_ids = previous_batch_ids
+             self.max_num_active_reqs = original_max_num_active_reqs
+             if original_wait_queues is not None:
+                 original_waiting, original_kv_holding = original_wait_queues
+@@ -816,6 +897,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+                 self.waiting, self.kv_holding_waiting = original_wait_queues
+             self._restore_omni_wait_queues()
+ 
++        if previous_batch_ids is not None:
++            previous_batch_ids.difference_update(scheduler_output.finished_req_ids)
++
+         # Backstop: a step built without ``_update_after_schedule`` (nothing
+         # booked, so nothing to reconcile) still leaves here uniform. On the
+         # booking paths the rewrite already ran ahead of the booking and this
+@@ -831,6 +915,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+         return self._wrap_omni_scheduler_output(
+             scheduler_output,
+             finished_requests_needing_kv_transfer=finished_reqs,
++            preserve_v1_batch=previous_batch_ids is not None,
+         )
+ 
+     def update_from_output(
+diff --git a/vllm_omni/core/sched/omni_generation_scheduler.py b/vllm_omni/core/sched/omni_generation_scheduler.py
+index 569a88797..1f79ed56d 100644
+--- a/vllm_omni/core/sched/omni_generation_scheduler.py
++++ b/vllm_omni/core/sched/omni_generation_scheduler.py
+@@ -3,10 +3,10 @@
+ 
+ from __future__ import annotations
+ 
+-import math
+ import queue
+ import time
+ from collections import defaultdict
++from collections.abc import Mapping
+ from typing import TYPE_CHECKING, Any
+ 
+ import torch
+@@ -52,6 +52,8 @@ def _has_async_chunk_payload_to_run(request: Request) -> bool:
+ 
+ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
+     waiting: RequestQueue
++    running: list[Request]
++    max_num_scheduled_tokens: int
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+@@ -60,43 +62,36 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
+         self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
+         self._supports_pending_generation = bool(getattr(model_config, "supports_pending_generation", False))
+         self._pending_finish_reqs: list[Request] = []
++        self._generation_pending_inputs: set[str] = set()
+         self._pending_chunk_error_outputs: list[tuple[int, EngineCoreOutput]] = []
+-        connector_config = getattr(model_config, "stage_connector_config", None)
+-        extra = (
+-            connector_config.get("extra", connector_config)
+-            if isinstance(connector_config, dict)
+-            else getattr(connector_config, "extra", None)
+-        ) or {}
+-        self._generation_min_batch_size = int(extra.get("generation_min_batch_size", 1))
+-        self._generation_max_wait_s = float(extra.get("generation_max_wait_ms", 0)) / 1000
++        self._init_generation_coalescing(self._get_scheduler_extra_config())
++
++    def _init_generation_coalescing(self, extra: Mapping[str, Any]) -> None:
++        """Initialize generation-specific batch and express scheduling policy."""
++        super()._init_generation_coalescing(extra)
+         self._generation_coalescing_policy = extra.get("generation_coalescing_policy", "fixed")
+         self._generation_max_regular_batch = int(extra.get("generation_max_regular_batch", 0) or 0)
+         if self._generation_max_regular_batch < 0:
+             raise ValueError("generation_max_regular_batch must be nonnegative")
+         if self._generation_coalescing_policy not in ("fixed", "idle_wait"):
+             raise ValueError("generation_coalescing_policy must be fixed or idle_wait")
+-        if not 1 <= self._generation_min_batch_size <= self.max_num_running_reqs:
+-            raise ValueError("generation_min_batch_size must be in [1, max_num_seqs]")
+-        if not math.isfinite(self._generation_max_wait_s) or self._generation_max_wait_s < 0:
+-            raise ValueError("generation_max_wait_ms must be finite and nonnegative")
+         if self._generation_max_wait_s and self._generation_min_batch_size > 1:
+             parallel = self.vllm_config.parallel_config
+-            if not self._native_data_plane:
+-                # CUDA-oriented profiles can inherit a platform's V1 runner.
+-                # Their connector extras survive that override, but batching
+-                # must revert to the fallback runner's default scheduling.
++            v1_ready_inputs = not self.use_v2_model_runner and self._get_coalescing_ready_request_ids() is not None
++            if not self._native_data_plane and not v1_ready_inputs:
+                 logger.warning(
+                     "Generation batch waiting and regular-batch limit ignored: "
+-                    "requires native MRV2; using default generation scheduling."
++                    "requires a native MRV2 stage or V1 input readiness support."
+                 )
+                 self._generation_min_batch_size = 1
+                 self._generation_max_wait_s = 0.0
+                 self._generation_max_regular_batch = 0
+-            elif not (
+-                self._retains_state_across_chunks
+-                and parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 1
+-            ):
+-                raise ValueError("Generation batch waiting requires a stateful native MRV2 TP1/PP1 stage")
++            elif parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
++                raise ValueError("Generation batch waiting requires TP1/PP1")
++            elif self._native_data_plane and not self._retains_state_across_chunks:
++                raise ValueError("Native MRV2 generation batch waiting requires a stateful stage")
++            elif v1_ready_inputs and self._generation_coalescing_policy != "fixed":
++                raise ValueError("V1 generation batch waiting supports only the fixed coalescing policy")
+             else:
+                 logger.info(
+                     "Generation input coalescing: target batch=%d, max wait=%.3f ms",
+@@ -189,41 +184,82 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
+             )
+             self._pending_chunk_error_outputs.append((finished_request.client_index, error_output))
+ 
++    def _generation_runnable_ids(self, ready_ids: set[str]) -> set[str]:
++        """Count streams, excluding stale notifications and outstanding runs."""
++        return {
++            req_id
++            for req_id in ready_ids
++            if (request := self.requests.get(req_id)) is not None
++            and not request.is_finished()
++            and request.num_in_flight_tokens == 0
++        }
++
++    def _process_pending_omni_inputs(self, model_mode: str) -> None:
++        """Process inputs for either runner, then apply V1-only batch waiting."""
++        super()._process_pending_omni_inputs(model_mode)
++        if not self.use_v2_model_runner:
++            self._process_v1_pending_omni_inputs()
++
++    def _process_v1_pending_omni_inputs(self) -> None:
++        """Coalesce received V1 inputs without blocking completion processing.
++
++        V1 readiness comes from the mixin hook after input processing.
++        Revisit its batch deadline on scheduler ticks; native V2 waiting is
++        handled separately by _drain_omni_connector_outputs().
++        """
++        self._generation_defer_batch = False
++        max_wait = getattr(self, "_generation_max_wait_s", 0.0)
++        if not max_wait or self._generation_min_batch_size <= 1 or self._pause_state != PauseState.UNPAUSED:
++            self._generation_batch_deadline = None
++            return
++        ready = self._get_coalescing_ready_request_ids()
++        if ready is None:
++            self._generation_batch_deadline = None
++            return
++        runnable = self._generation_runnable_ids(ready)
++        if not runnable or self._generation_batch_ready(runnable) or runnable & self._generation_pending_inputs:
++            # A model yielding part of an input must keep executing that input;
++            # its retained ready marker is not a newly arrived chunk.
++            self._generation_batch_deadline = None
++            return
++        deadline = getattr(self, "_generation_batch_deadline", None)
++        now = time.monotonic()
++        if deadline is None:
++            deadline = now + max_wait
++        self._generation_defer_batch = now < deadline
++        self._generation_batch_deadline = deadline if self._generation_defer_batch else None
++
+     def _drain_omni_connector_outputs(self):
+         self._generation_defer_batch = False
+         outputs = super()._drain_omni_connector_outputs()
+         max_wait = getattr(self, "_generation_max_wait_s", 0)
+         target = getattr(self, "_generation_min_batch_size", 1)
+         coordinator = self.input_coordinator
+-        if not max_wait or target <= 1 or coordinator is None or self._pause_state != PauseState.UNPAUSED:
++        if (
++            not self._native_data_plane
++            or not max_wait
++            or target <= 1
++            or coordinator is None
++            or self._pause_state != PauseState.UNPAUSED
++        ):
+             return outputs
+ 
+         # Count distinct runnable streams, not notifications, padding rows, or
+         # chunks whose previous execution still owns their state. Waiting here
+         # precedes allocation and metadata replacement. Do not schedule a batch
+         # and then discard it to try to accumulate more input.
+-        ready = set(coordinator.requests_with_ready_chunks)
+-        terminal = set(coordinator.finished_requests) | set(coordinator.input_terminal_req_ids)
++        ready = self._get_coalescing_ready_request_ids(outputs)
++        if ready is None:
++            return outputs
+         deadline = getattr(self, "_generation_batch_deadline", None)
+         if deadline is None:
+             deadline = time.monotonic() + max_wait
+         in_flight = any(
+             not request.is_finished() and request.num_in_flight_tokens > 0 for request in self.requests.values()
+         )
+-        new_outputs = outputs
+         waited_without_input = False
+         while True:
+-            for output in new_outputs:
+-                ready.update(output.chunk_ready_req_ids)
+-                terminal.update(output.chunk_finished_req_ids)
+-                terminal.update(req_id for req_id, update in output.request_metadata.items() if update.input_terminal)
+-            runnable = {
+-                req_id
+-                for req_id in ready | terminal
+-                if (request := self.requests.get(req_id)) is not None
+-                and not request.is_finished()
+-                and request.num_in_flight_tokens == 0
+-            }
++            runnable = self._generation_runnable_ids(ready)
+             if runnable and waited_without_input:
+                 # Idle waiting must not eat the ready batch's coalescing budget.
+                 # Start that budget at its first arrival, once only. The two
+@@ -251,7 +287,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
+                 if not can_wait_idle:
+                     break
+                 waited_without_input = True
+-            elif len(runnable) >= target or len(self.requests) < target:
++            elif self._generation_batch_ready(runnable):
+                 break
+             remaining = deadline - time.monotonic()
+             if remaining <= 0:
+@@ -279,6 +315,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
+                     break
+                 outputs.append(output)
+                 new_outputs.append(output)
++            ready.update(self._get_coalescing_ready_request_ids(new_outputs) or ())
+         self._generation_batch_deadline = None
+         return outputs
+ 
+@@ -707,8 +744,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
+                 # requests with empty prompt_token_ids.
+                 self._restore_omni_wait_queues()
+             else:
+-                res = super().schedule(throttle_prefills)
+-                self._restore_omni_wait_queues()
++                original_token_budget = self.max_num_scheduled_tokens
++                try:
++                    # Custom input readiness can defer stages without a
++                    # connector. The upstream fallback must honor that gate.
++                    if getattr(self, "_generation_defer_batch", False):
++                        self.max_num_scheduled_tokens = 0
++                    res = super().schedule(throttle_prefills)
++                finally:
++                    self.max_num_scheduled_tokens = original_token_budget
++                    self._restore_omni_wait_queues()
+                 self._postprocess_omni_schedule_output(res)
+                 return self._wrap_omni_scheduler_output(res)
+ 
+@@ -837,6 +882,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
+     def _free_request(
+         self, request: Request, delay_free_blocks: bool = False
+     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
++        pending_inputs = getattr(self, "_generation_pending_inputs", None)
++        if pending_inputs is not None:
++            pending_inputs.discard(request.request_id)
+         if getattr(self, "_first_chunk_express", False):
+             self._chunk_started.discard(request.request_id)
+             getattr(self, "_stream_audio", {}).pop(request.request_id, None)
+@@ -1013,6 +1061,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
+             # One-shot generation request: finish after its current input unit
+             # has been fully processed.
+             generation_pending = req_id in getattr(model_runner_output, "pending_generation_req_ids", set())
++            pending_inputs = getattr(self, "_generation_pending_inputs", None)
++            if pending_inputs is not None:
++                if generation_pending:
++                    pending_inputs.add(req_id)
++                else:
++                    pending_inputs.discard(req_id)
+             if generation_pending:
+                 # The model owns its AR/KV state and yielded an output chunk.
+                 # Re-schedule this input unit without inventing output tokens.
+diff --git a/vllm_omni/core/sched/omni_scheduler_mixin.py b/vllm_omni/core/sched/omni_scheduler_mixin.py
+index 71ef24ee1..115c5b0c2 100644
+--- a/vllm_omni/core/sched/omni_scheduler_mixin.py
++++ b/vllm_omni/core/sched/omni_scheduler_mixin.py
+@@ -175,6 +175,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
+ 
+     # Provided by the concrete vLLM scheduler.
+     vllm_config: VllmConfig
++    max_num_running_reqs: int
+     requests: dict[str, Request]
+     waiting: RequestQueue
+     kv_holding_waiting: RequestQueue
+@@ -335,6 +336,85 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
+         session.num_prompt_tokens = len(new_prompt)
+         self._finish_streaming_session_update(session, update)
+ 
++    def _get_scheduler_extra_config(self) -> dict[str, Any]:
++        """Resolve stage settings, with legacy connector values taking precedence."""
++        connector_config = getattr(self.vllm_config.model_config, "stage_connector_config", None)
++        extra = (
++            connector_config.get("extra", connector_config)
++            if isinstance(connector_config, dict)
++            else getattr(connector_config, "extra", None)
++        ) or {}
++        additional = getattr(self.vllm_config, "additional_config", None)
++        return {**(additional if isinstance(additional, dict) else {}), **extra}
++
++    def _init_generation_coalescing(self, extra: Mapping[str, Any]) -> None:
++        """Initialize shared batch settings from scheduler-resolved config.
++
++        Runner, topology and scheduling-policy checks belong to each scheduler.
++        """
++        self._generation_min_batch_size = int(extra.get("generation_min_batch_size", 1))
++        self._generation_max_wait_s = float(extra.get("generation_max_wait_ms", 0)) / 1000
++        self._generation_always_wait_target_batch = extra.get("generation_always_wait_target_batch", False)
++        self._generation_batch_deadline: float | None = None
++        if not 1 <= self._generation_min_batch_size <= self.max_num_running_reqs:
++            raise ValueError("generation_min_batch_size must be in [1, max_num_seqs]")
++        if not math.isfinite(self._generation_max_wait_s) or self._generation_max_wait_s < 0:
++            raise ValueError("generation_max_wait_ms must be finite and nonnegative")
++        if not isinstance(self._generation_always_wait_target_batch, bool):
++            raise ValueError("generation_always_wait_target_batch must be a boolean")
++
++    def _generation_batch_ready(self, runnable: set[str]) -> bool:
++        """Optionally cap the target at the registered request population."""
++        target = self._generation_min_batch_size
++        if getattr(self, "_generation_always_wait_target_batch", False):
++            target = min(target, len(self.requests))
++            return len(runnable) >= target
++        return len(runnable) >= target or len(self.requests) < target
++
++    def _get_coalescing_ready_request_ids(
++        self, connector_outputs: Iterable[OmniConnectorOutput] = ()
++    ) -> set[str] | None:
++        """Snapshot input-ready IDs without consuming input or notifications.
++
++        Return None for an unsupported input source, or an empty set for a
++        supported source with no ready input. Orchestrator-fed stage zero uses
++        queued request state; subclasses can override other input sources.
++        It is also queried during coalescing policy initialization, before
++        requests are registered.
++
++        Native notifications may not yet be applied to the coordinator, so
++        include the supplied outputs. Terminal signals allow final work to
++        participate in coalescing. Callers retain responsibility for filtering
++        stale, finished or in-flight requests and deciding execution eligibility.
++        """
++        # V1: readiness is tracked by the legacy chunk-transfer adapter.
++        adapter = self.chunk_transfer_adapter
++        if adapter is not None and adapter.receives_chunks:
++            return set(adapter.requests_with_ready_chunks)
++        # Check for native connector input before using the shared fallback.
++        coordinator = self.input_coordinator
++        if not self._native_data_plane or coordinator is None or not coordinator.receives_chunks:
++            # V1 and V2: Stage zero receives prompts/appends from the orchestrator.
++            # Parked streams stay excluded until an append resumes admission.
++            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
++            if getattr(model_config, "stage_id", None) == 0:
++                return {
++                    request.request_id
++                    for queue_name in ("waiting", "kv_holding_waiting")
++                    for request in getattr(self, queue_name, ())
++                    if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
++                }
++            return None
++        # V2: combine native coordinator state with unapplied notifications.
++        ready = set(coordinator.requests_with_ready_chunks)
++        ready.update(coordinator.finished_requests)
++        ready.update(coordinator.input_terminal_req_ids)
++        for output in connector_outputs:
++            ready.update(output.chunk_ready_req_ids)
++            ready.update(output.chunk_finished_req_ids)
++            ready.update(req_id for req_id, update in output.request_metadata.items() if update.input_terminal)
++        return ready
++
+     def _async_chunk_transport_enabled(self) -> bool:
+         return getattr(self, "chunk_transfer_adapter", None) is not None or bool(
+             getattr(self, "_native_data_plane", False)
+@@ -741,6 +821,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
+         pending_input_registrations: list[OmniChunkRecvHandle] | None = None,
+         data_plane_terminal_req_ids: set[str] | None = None,
+         input_terminal_req_ids: set[str] | None = None,
++        preserve_v1_batch: bool = False,
+     ) -> OmniSchedulerOutput:
+         """Wrap a base ``SchedulerOutput`` in ``OmniSchedulerOutput``.
+ 
+@@ -786,6 +867,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
+             data_plane_terminal_req_ids=data_plane_terminal_req_ids,
+             input_terminal_req_ids=input_terminal_req_ids or set(),
+             pending_request_prewarms=request_prewarms,
++            preserve_v1_batch=preserve_v1_batch,
+         )
+         OmniSchedulerMixin._duplex_stage_work_recorder(self).step_begin(scheduler_output, getattr(self, "requests", {}))
+         return scheduler_output
+diff --git a/vllm_omni/core/sched/output.py b/vllm_omni/core/sched/output.py
+index 8b94a0a0a..c8534d794 100644
+--- a/vllm_omni/core/sched/output.py
++++ b/vllm_omni/core/sched/output.py
+@@ -139,3 +139,5 @@ class OmniSchedulerOutput(SchedulerOutput):
+     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
+     input_terminal_req_ids: set[str] = field(default_factory=set)
+     pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)
++    # Coalescing-only V1 AR idle steps retain persistent rows for the next run.
++    preserve_v1_batch: bool = False
+diff --git a/vllm_omni/worker/gpu_model_runner.py b/vllm_omni/worker/gpu_model_runner.py
+index 24b61c861..a701085c6 100644
+--- a/vllm_omni/worker/gpu_model_runner.py
++++ b/vllm_omni/worker/gpu_model_runner.py
+@@ -647,7 +647,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
+         # that case we include the resumed_req_ids in the unscheduled set so
+         # that they get cleared from the persistent batch before being re-scheduled
+         # in the normal resumed request path.
+-        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
++        preserve_batch = (
++            getattr(scheduler_output, "preserve_v1_batch", False) and scheduler_output.total_num_scheduled_tokens == 0
++        )
++        unscheduled_req_ids = set() if preserve_batch else cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+         # NOTE(woosuk): The persistent batch optimization assumes that
+         # consecutive batches contain mostly the same requests. If batches
+         # have low request overlap (e.g., alternating between two distinct
+@@ -778,7 +781,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
+                 scheduler_output,
+                 self.input_batch.req_id_to_index,
+             )
+-        if self.use_async_spec_decode:
++        if self.use_async_spec_decode and not preserve_batch:
+             self.prev_num_draft_tokens.np.fill(0)
+ 
+         for i, req_id in enumerate(req_data.req_ids):
+@@ -906,12 +909,13 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
+         # Condense the batched states if there are gaps left by removed requests
+         self.input_batch.condense()
+         # Allow attention backend to reorder the batch, potentially
+-        self._may_reorder_batch(scheduler_output)
++        if not preserve_batch:
++            self._may_reorder_batch(scheduler_output)
+         # Refresh batch metadata with any pending updates.
+         self.input_batch.refresh_metadata()
+ 
+         # Incrementally update ngram_gpu tensors after batch is stable
+-        if is_ngram_gpu:
++        if is_ngram_gpu and not preserve_batch:
+             update_ngram_gpu_tensors_incremental(
+                 self.input_batch,
+                 self.token_ids_gpu_tensor,

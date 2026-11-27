@@ -1,0 +1,262 @@
+diff --git a/tests/engine/duplex/test_session_runner.py b/tests/engine/duplex/test_session_runner.py
+index d92b7d8af..0328cb6fc 100644
+--- a/tests/engine/duplex/test_session_runner.py
++++ b/tests/engine/duplex/test_session_runner.py
+@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
+ from dataclasses import dataclass, field, replace
+ from types import SimpleNamespace
+ from typing import Any
++from unittest.mock import AsyncMock
+ 
+ import numpy as np
+ import pytest
+@@ -604,6 +605,33 @@ def b64(data: bytes) -> str:
+ # --------------------------------------------------------------------------- #
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize("audio_format", ["pcm_f32le", "pcm16", "g711_ulaw", "g711_alaw"])
++async def test_input_conversion_offload_only_for_encoded_formats(audio_format: str, monkeypatch) -> None:
++    h = await open_harness(auto_response=False)
++    try:
++        offload = AsyncMock(wraps=h.runner.offload)
++        monkeypatch.setattr(h.runner, "offload", offload)
++        if audio_format == "pcm_f32le":
++            audio = pcm_f32(1600, value=0.125)
++        elif audio_format == "pcm16":
++            audio = np.full(1600, 4096, dtype="<i2").tobytes()
++        else:
++            audio = b"\x00" * 1600
++        events = await h.run(
++            commands.AppendAudio(audio=audio, format=audio_format, sample_rate_hz=16000, is_speech=True)
++        )
++        if audio_format == "pcm_f32le":
++            offload.assert_not_awaited()
++        else:
++            offload.assert_awaited_once()
++        events += await h.run(commands.Commit(create_response=True))
++        assert "error" not in types(events)
++        assert h.port.submissions
++    finally:
++        await close_harness(h)
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("camera_update", [False, True])
+ async def test_aura_asr_transcript_does_not_project_as_assistant_output(camera_update: bool) -> None:
+@@ -1019,10 +1047,20 @@ async def test_audio_admission_is_held_until_preprocessing_finishes(monkeypatch,
+     monkeypatch.setattr(owner, method, blocked)
+     monkeypatch.setattr(h.runner, "_on_command", track_command)
+     try:
+-        h.submit(append_audio(samples=8000))
++        command = append_audio(samples=8000)
++        if phase == "decode":
++            # Float32 PCM bypasses conversion; use PCM16 to exercise the offload.
++            command = commands.AppendAudio(
++                audio=np.full(8000, 4096, dtype="<i2").tobytes(),
++                format="pcm16",
++                sample_rate_hz=16000,
++                is_speech=True,
++            )
++        h.submit(command)
+         await asyncio.wait_for(started.wait(), timeout=2.0)
+-        assert h.session.pending_input_bytes == 32_000
+-        h.submit(append_audio(samples=10_000, event_id="over-limit"))
++        assert h.session.pending_input_bytes == len(command.audio)
++        # This append fills the budget alone, so either wire format exceeds it.
++        h.submit(append_audio(samples=16_000, event_id="over-limit"))
+         events = await h.settle()
+         assert any(
+             event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "over-limit"
+diff --git a/tests/engine/test_duplex_omni_engine.py b/tests/engine/test_duplex_omni_engine.py
+index ddd4197ec..e1fbea869 100644
+--- a/tests/engine/test_duplex_omni_engine.py
++++ b/tests/engine/test_duplex_omni_engine.py
+@@ -9,6 +9,7 @@ import asyncio
+ import queue
+ from types import SimpleNamespace
+ from typing import Any
++from unittest.mock import Mock
+ 
+ import pytest
+ 
+@@ -51,7 +52,7 @@ class _FakeSyncQueue:
+         self.items: list[Any] = []
+         self.full = full
+ 
+-    def put(self, item: Any, timeout: float | None = None) -> None:
++    def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
+         if self.full:
+             raise queue.Full
+         self.items.append(item)
+@@ -168,9 +169,11 @@ async def test_engine_error_and_timeout_map_to_session_errors() -> None:
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_submit_command_is_one_way_on_the_request_queue() -> None:
++async def test_submit_command_is_one_way_on_the_request_queue(monkeypatch) -> None:
+     engine = _engine(None)
+     command = Heartbeat(event_id="evt-1")
++    executor = Mock(side_effect=AssertionError("uncontended enqueue must not use the executor"))
++    monkeypatch.setattr(asyncio.get_running_loop(), "run_in_executor", executor)
+ 
+     await engine.submit_command_async("sid", command)
+ 
+@@ -178,6 +181,61 @@ async def test_submit_command_is_one_way_on_the_request_queue() -> None:
+     assert isinstance(message, DuplexSessionCommandMessage)
+     assert message.session_id == "sid" and message.command is command
+     assert engine.rpc_client.calls == []
++    executor.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_full_command_queue_offloads_wait_and_preserves_sequential_order(monkeypatch) -> None:
++    engine = _engine(None)
++    sync_q: queue.Queue[object] = queue.Queue(maxsize=1)
++    occupied = object()
++    sync_q.put_nowait(occupied)
++    engine.request_queue.sync_q = sync_q
++    loop = asyncio.get_running_loop()
++    waiting = asyncio.Event()
++    original_submit = engine._submit_command
++    attempts: list[tuple[DuplexSessionCommandMessage, bool]] = []
++
++    def submit_after_full(message: DuplexSessionCommandMessage, *, block: bool = True) -> None:
++        attempts.append((message, block))
++        if block:
++            loop.call_soon_threadsafe(waiting.set)
++        original_submit(message, block=block)
++
++    monkeypatch.setattr(engine, "_submit_command", submit_after_full)
++    first, second = Heartbeat(event_id="first"), Heartbeat(event_id="second")
++
++    async def publish():
++        await engine.submit_command_async("sid", first)
++        await engine.submit_command_async("sid", second)
++
++    async def receive():
++        while True:
++            try:
++                return sync_q.get_nowait()
++            except queue.Empty:
++                await asyncio.sleep(0.001)
++
++    task = asyncio.create_task(publish())
++    received = []
++    try:
++        await asyncio.wait_for(waiting.wait(), timeout=2)
++        assert not task.done()
++        assert len(attempts) == 2
++        assert attempts[0][1] is False and attempts[1][1] is True
++        assert attempts[0][0] is attempts[1][0]
++        assert sync_q.get_nowait() is occupied
++        for _ in range(2):
++            message = await asyncio.wait_for(receive(), timeout=2)
++            received.append(message.command)
++        await asyncio.wait_for(task, timeout=2)
++        assert received == [first, second]
++    finally:
++        # Release any blocked publisher if an assertion above fails.
++        while not sync_q.empty():
++            sync_q.get_nowait()
++        task.cancel()
++        await asyncio.gather(task, return_exceptions=True)
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/vllm_omni/engine/duplex/session/runner.py b/vllm_omni/engine/duplex/session/runner.py
+index 373f71714..c1b9abf25 100644
+--- a/vllm_omni/engine/duplex/session/runner.py
++++ b/vllm_omni/engine/duplex/session/runner.py
+@@ -1302,7 +1302,8 @@ class DuplexSessionRunner:
+                 value = event.get(key)
+                 if isinstance(value, str) and value.strip().lower() in {"barge_in", "interrupt", "cancel"}:
+                     event.pop(key, None)
+-        fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm16"
++        format_value = event.get("format")
++        fmt = format_value if isinstance(format_value, str) else "pcm16"
+         sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
+         sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else 16000
+         client_force_listen = bool(event.get("force_listen", False))
+@@ -1320,23 +1321,28 @@ class DuplexSessionRunner:
+             detected = [(event, None)]
+         else:
+             try:
+-                converted: tuple[object, object, int | float | None] = await self.offload(
+-                    convert_input_audio_with_rate,
+-                    audio,
+-                    fmt,
+-                    sample_rate_hz=sample_rate_hz,
+-                )
++                converted: tuple[object, object, int | float | None]
++                if fmt.lower() == "pcm_f32le":
++                    # Already native PCM: avoid an executor round trip for a no-op.
++                    converted = audio, fmt, sample_rate_hz
++                else:
++                    converted = await self.offload(
++                        convert_input_audio_with_rate,
++                        audio,
++                        fmt,
++                        sample_rate_hz=sample_rate_hz,
++                    )
+             except ValueError as exc:
+                 self._emit_error("bad_event", str(exc))
+                 return
+-            audio, fmt, converted_rate = converted
++            audio, converted_format, converted_rate = converted
+             if converted_rate is not None:
+                 sample_rate_hz = converted_rate
+-            if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
++            if isinstance(converted_format, str) and converted_format.lower() in {"pcm16", "pcm_s16le", "s16le"}:
+                 self._emit_error("bad_audio", "input_audio_buffer.append pcm16 audio could not be decoded")
+                 return
+             event["audio"] = audio
+-            event["format"] = fmt
++            event["format"] = converted_format
+             event["sample_rate_hz"] = sample_rate_hz
+             detected = await self.control.run_turn_detection(event)
+         with ExitStack() as unprocessed:
+diff --git a/vllm_omni/engine/duplex_omni_engine.py b/vllm_omni/engine/duplex_omni_engine.py
+index 0ca69284d..519d387d1 100644
+--- a/vllm_omni/engine/duplex_omni_engine.py
++++ b/vllm_omni/engine/duplex_omni_engine.py
+@@ -334,21 +334,32 @@ class DuplexOmniEngine(AsyncOmniEngine):
+             ),
+         )
+ 
+-    def _submit_command(self, session_id: str, command: DuplexCommand) -> None:
+-        """One-way: enqueue a session command in caller order (blocks only on queue backpressure)."""
++    def _submit_command(self, message: DuplexSessionCommandMessage, *, block: bool = True) -> None:
++        """Enqueue a command; propagate nonblocking queue.Full, or map a blocking timeout to backpressure."""
+         if not self.is_alive():
+-            raise DuplexSessionError("engine is not alive", code="engine_dead", session_id=session_id)
+-        message = DuplexSessionCommandMessage(session_id=session_id, command=command)
++            raise DuplexSessionError("engine is not alive", code="engine_dead", session_id=message.session_id)
+         try:
+-            self.request_queue.sync_q.put(message, timeout=_COMMAND_PUT_TIMEOUT_S)
++            self.request_queue.sync_q.put(message, block=block, timeout=_COMMAND_PUT_TIMEOUT_S if block else None)
+         except queue.Full as exc:
++            if not block:
++                raise
+             raise DuplexSessionError(
+-                "engine request queue is full", code="engine_backpressure", retryable=True, session_id=session_id
++                "engine request queue is full",
++                code="engine_backpressure",
++                retryable=True,
++                session_id=message.session_id,
+             ) from exc
+ 
+     async def submit_command_async(self, session_id: str, command: DuplexCommand) -> None:
++        message = DuplexSessionCommandMessage(session_id=session_id, command=command)
++        try:
++            self._submit_command(message, block=False)
++            return
++        except queue.Full:
++            # Wait for capacity off the event loop, retaining the existing timeout.
++            pass
+         loop = asyncio.get_running_loop()
+-        await loop.run_in_executor(None, lambda: self._submit_command(session_id, command))
++        await loop.run_in_executor(None, self._submit_command, message)
+ 
+ 
+ __all__ = ["DuplexOmniEngine"]

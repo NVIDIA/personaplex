@@ -1,0 +1,10 @@
+FROM vllm/vllm:v0.33.0
+
+COPY resources/ /opt/resources/
+
+RUN uv pip install --system --python python3 --no-cache-dir \
+    --constraint /opt/resources/constraints.txt "vllm-omni==0.33.0rc1"
+
+# Replace the inherited API-server entrypoint with a benchmark-friendly shell.
+ENTRYPOINT []
+CMD ["/bin/bash"]
