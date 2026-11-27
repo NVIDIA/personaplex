@@ -107,6 +107,13 @@ python -m moshi.offline \
   --output-text "output.json"
 ```
 
+### Usage Examples
+
+A series of [examples](examples) showcasing how to use PersonaPlex in a variety of scenarios are also included. These are the following:
+
+- [vllm-omni_high-concurrency](examples/vllm-omni_high-concurrency): shows how to deploy a PersonaPlex instance using vLLM-Omni `v0.33.0rc1`,
+with a series of ad-hoc optimizations, allowing to reach 96 real-time requests on NVIDIA RTX Pro 6000.
+
 ## Voices
 
 PersonaPlex supports a wide range of voices; we pre-package embeddings for voices that sound more natural and conversational (NAT) and others that are more varied (VAR). The fixed set of voices are labeled:
